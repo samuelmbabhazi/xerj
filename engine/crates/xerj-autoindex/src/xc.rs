@@ -8,9 +8,10 @@
 //! (`xerj corpus index`). Exit codes: 0 hits / 1 no-match-or-incomplete /
 //! 2 usage-transport-stale / 3 corpus-in-state-but-not-loaded-here.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -109,6 +110,183 @@ fn emit(out: &CodeOutcome) {
     }
 }
 
+// ── empty ledger, but the node already has autoindex prefixes (#2181) ──────
+//
+// `xerj code` / `xerj corpus` read `~/.xerj-code`. `xerj autoindex --prefix`
+// writes the node's catalog and does not touch that directory, so an empty
+// ledger used to read as "nothing is indexed" on a node that already answers
+// `xerj search --prefix`. The hint names those prefixes. It is one short
+// request: [`Es::search`] retries a dead node for ~8s of backoff, and this
+// path must stay quiet instead.
+
+/// How long the hint waits for a connect. A refused port returns at once;
+/// a blackhole must not hold `xerj corpus list`.
+const CATALOG_HINT_CONNECT: Duration = Duration::from_millis(800);
+/// Whole-request budget, connect included. One attempt, no retry.
+const CATALOG_HINT_TIMEOUT: Duration = Duration::from_secs(2);
+/// Catalog replies larger than this are not a prefix list. Ignore them.
+const CATALOG_HINT_BODY_CAP: usize = 1024 * 1024;
+/// How many prefix names the hint prints before it says "N more".
+const CATALOG_HINT_PREFIX_CAP: usize = 8;
+
+/// `{root}/state` has no `*.json` ledger. A missing directory is empty.
+fn ledger_is_empty(root: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(root.join("state")) else {
+        return true;
+    };
+    !entries
+        .flatten()
+        .any(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+}
+
+/// A prefix safe to paste into the hint's command. Anything else (spaces,
+/// quotes, a newline) is dropped so a catalog value cannot forge a line.
+fn hintable_prefix(prefix: &str) -> bool {
+    (1..=128).contains(&prefix.len())
+        && prefix
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+/// The lines to print. `None` when nothing safe remains.
+fn format_autoindex_prefix_hint(prefixes: &[String]) -> Option<String> {
+    let mut names: Vec<&str> = prefixes
+        .iter()
+        .map(String::as_str)
+        .filter(|prefix| hintable_prefix(prefix))
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    let example = *names.first()?;
+    let shown = if names.len() <= CATALOG_HINT_PREFIX_CAP {
+        names.join(", ")
+    } else {
+        format!(
+            "{}, … ({} more)",
+            names[..CATALOG_HINT_PREFIX_CAP].join(", "),
+            names.len() - CATALOG_HINT_PREFIX_CAP
+        )
+    };
+    let each = if names.len() > 1 {
+        " (same --prefix for each)"
+    } else {
+        ""
+    };
+    Some(format!(
+        "this node's autoindex catalog has prefixes: {shown}\n\
+         search them with `xerj search --prefix {example}` or `xerj def --prefix {example}`{each}; \
+         register a folder for `xerj code` with `xerj corpus add <name> <path>`"
+    ))
+}
+
+/// Explicit key, else `XERJ_API_KEY`, else the loopback admin key. Silent:
+/// the hint must not announce a key and then say nothing when the node is down.
+fn resolve_hint_key(url: &str, explicit: Option<&str>) -> Option<String> {
+    if let Some(key) = explicit.filter(|key| !key.is_empty()) {
+        return Some(key.to_string());
+    }
+    if let Some(key) = std::env::var("XERJ_API_KEY")
+        .ok()
+        .filter(|key| !key.is_empty())
+    {
+        return Some(key);
+    }
+    if url_is_loopback(url) {
+        discover_local_admin_key_for_url(url).map(|(key, _path)| key)
+    } else {
+        None
+    }
+}
+
+/// Distinct `prefix` values on catalog run documents.
+///
+/// Same query as `catalog_run_prefixes` in `search.rs`: `doc_kind: run`,
+/// `_source: prefix`, size 200. `None` when `/hits/hits` is absent — that is
+/// not an empty catalog.
+fn prefixes_from_catalog_hits(v: &Value) -> Option<Vec<String>> {
+    let hits = v.pointer("/hits/hits")?.as_array()?;
+    let mut prefixes = BTreeSet::new();
+    for hit in hits {
+        if let Some(prefix) = hit.pointer("/_source/prefix").and_then(Value::as_str) {
+            if !prefix.is_empty() {
+                prefixes.insert(prefix.to_string());
+            }
+        }
+    }
+    Some(prefixes.into_iter().collect())
+}
+
+/// One catalog read. `None` on any failure, including a node that is not
+/// there: callers print nothing in that case.
+fn fetch_catalog_run_prefixes(url: &str, explicit_key: Option<&str>) -> Option<Vec<String>> {
+    let http = reqwest::blocking::Client::builder()
+        .connect_timeout(CATALOG_HINT_CONNECT)
+        .timeout(CATALOG_HINT_TIMEOUT)
+        .danger_accept_invalid_certs(true)
+        .build()
+        .ok()?;
+    let body = json!({
+        "size": 200,
+        "query": { "term": { "doc_kind": "run" } },
+        "_source": ["prefix"]
+    });
+    let endpoint = format!(
+        "{}/{}/_search",
+        url.trim_end_matches('/'),
+        xerj_common::AUTOINDEX_CATALOG_INDEX
+    );
+    let mut req = http.post(endpoint).json(&body);
+    if let Some(key) = resolve_hint_key(url, explicit_key) {
+        req = req.header("Authorization", format!("ApiKey {key}"));
+    }
+    let resp = req.send().ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let bytes = resp.bytes().ok()?;
+    if bytes.len() > CATALOG_HINT_BODY_CAP {
+        return None;
+    }
+    let parsed: Value = serde_json::from_slice(&bytes).ok()?;
+    prefixes_from_catalog_hits(&parsed)
+}
+
+/// Hint text, or `None` when the node did not answer or has no safe prefix.
+fn catalog_prefix_hint(url: &str, explicit_key: Option<&str>) -> Option<String> {
+    format_autoindex_prefix_hint(&fetch_catalog_run_prefixes(url, explicit_key)?)
+}
+
+/// After a not-indexed refusal, when the ledger itself is empty. A stale
+/// index, a bad state file, or a transport error already names its own next
+/// step, and those ledgers are not empty.
+fn append_autoindex_prefix_hint(
+    out: &mut CodeOutcome,
+    root: &Path,
+    url: &str,
+    api_key: Option<&str>,
+) {
+    if out.exit != 2 || !out.to_stderr || !ledger_is_empty(root) {
+        return;
+    }
+    let Some(hint) = catalog_prefix_hint(url, api_key) else {
+        return;
+    };
+    if !out.text.is_empty() && !out.text.ends_with('\n') {
+        out.text.push('\n');
+    }
+    out.text.push_str(&hint);
+}
+
+fn push_prefix_hint(stderr: &mut String, url: &str) {
+    if let Some(hint) = catalog_prefix_hint(url, None) {
+        if !stderr.is_empty() && !stderr.ends_with('\n') {
+            stderr.push('\n');
+        }
+        stderr.push_str(&hint);
+        stderr.push('\n');
+    }
+}
+
 // ── xerj code ───────────────────────────────────────────────────────────────
 
 const CODE_USAGE: &str =
@@ -136,16 +314,33 @@ retrieval over a reference corpus (see `xerj corpus list`):
 
 /// `xerj code …` — returns the process exit code.
 pub fn run_code_cli(args: &[String]) -> i32 {
+    match code_cli_outcome(args) {
+        CodeCliDone::Printed(code) => code,
+        CodeCliDone::Outcome(out) => {
+            let code = out.exit;
+            emit(&out);
+            code
+        }
+    }
+}
+
+enum CodeCliDone {
+    /// Usage and client-build failures already printed their own lines.
+    Printed(i32),
+    Outcome(CodeOutcome),
+}
+
+fn code_cli_outcome(args: &[String]) -> CodeCliDone {
     let mut corpus: Option<String> = None;
     let mut query: Option<String> = None;
     let mut url: Option<String> = None;
     let mut api_key: Option<String> = None;
     let mut p = CodeParams::new("", "");
     let mut i = 0;
-    let bad = |msg: String| -> i32 {
+    let bad = |msg: String| -> CodeCliDone {
         eprintln!("{msg}\n");
         eprintln!("{CODE_USAGE}");
-        2
+        CodeCliDone::Printed(2)
     };
     while i < args.len() {
         let a = &args[i];
@@ -163,7 +358,7 @@ pub fn run_code_cli(args: &[String]) -> i32 {
         match a.as_str() {
             "-h" | "--help" => {
                 println!("{CODE_USAGE}");
-                return 0;
+                return CodeCliDone::Printed(0);
             }
             "-k" => {
                 let v = val!("-k");
@@ -214,18 +409,19 @@ pub fn run_code_cli(args: &[String]) -> i32 {
         return bad("xerj code: both <corpus> and \"<query>\" are required".to_string());
     };
     let url = resolve_url(url.as_deref());
-    let es = match build_es(&url, api_key) {
+    let es = match build_es(&url, api_key.clone()) {
         Ok(es) => es,
         Err(e) => {
             eprintln!("xerj code: cannot reach {url}: {e:#}");
-            return 2;
+            return CodeCliDone::Printed(2);
         }
     };
     p.corpus = corpus;
     p.query = query;
-    let out = xccode::run_code_query(&code_root(), &EsXc(&es), &url, &p, "`--stale-ok`");
-    emit(&out);
-    out.exit
+    let root = code_root();
+    let mut out = xccode::run_code_query(&root, &EsXc(&es), &url, &p, "`--stale-ok`");
+    append_autoindex_prefix_hint(&mut out, &root, &url, api_key.as_deref());
+    CodeCliDone::Outcome(out)
 }
 
 // ── xerj corpus add ─────────────────────────────────────────────────────────
@@ -1979,6 +2175,393 @@ fn legacy_failure_verdict(before: Option<u64>, after: Option<u64>) -> LegacyFail
     }
 }
 
+/// One `autoindex-state/<corpus>/b<stamp>` directory left by a `corpus index`
+/// that was killed before the ledger recorded the build.
+#[derive(Debug, Clone)]
+struct UnfinishedBuild {
+    build: String,
+    prefix: String,
+    state_dir: PathBuf,
+    /// A `sync_begin` the journal has not closed with `sync_commit`. That is
+    /// the generation the index phase replays; autoindex does not hash the
+    /// corpus again on that path.
+    generation_pending: bool,
+}
+
+/// What a resumed build may be recorded as, once autoindex has returned and
+/// the node has been counted and searched.
+#[derive(Debug, PartialEq, Eq)]
+enum ResumeVerdict {
+    /// Clean autoindex exit, records present, search answered.
+    Verified,
+    /// Records present and searchable, but autoindex did not exit cleanly.
+    /// The build is kept and marked salvaged so status explains the gap.
+    Salvaged,
+    /// Autoindex exited cleanly and records are present, but the store did
+    /// not answer a search. Recorded as unverified, not as "no build".
+    Unverified,
+    /// Do not write a ledger. The journal stays the resume point. Writing a
+    /// ledger with no build is what made a finished resume say "no verified
+    /// build recorded".
+    KeepJournal,
+}
+
+fn resume_verdict(rc: i32, docs: Option<u64>, queryable: bool) -> ResumeVerdict {
+    let positive = matches!(docs, Some(n) if n > 0);
+    let clean = rc == 0 || rc == 3;
+    match (clean, positive, queryable) {
+        (true, true, true) => ResumeVerdict::Verified,
+        (false, true, true) => ResumeVerdict::Salvaged,
+        (true, true, false) => ResumeVerdict::Unverified,
+        _ => ResumeVerdict::KeepJournal,
+    }
+}
+
+fn resume_build_note(name: &str, unfinished: &UnfinishedBuild) -> String {
+    if unfinished.generation_pending {
+        format!(
+            "xerj corpus index: resuming build {} of '{name}' from its journal at {} — \
+             indexing continues at the operations still uncommitted, and files already \
+             applied are not hashed again",
+            unfinished.build,
+            unfinished.state_dir.display()
+        )
+    } else {
+        format!(
+            "xerj corpus index: resuming build {} of '{name}' from {} — the journal has no \
+             generation in progress, so this run re-walks and re-hashes the corpus, then \
+             reuses a sealed snapshot when one is already present",
+            unfinished.build,
+            unfinished.state_dir.display()
+        )
+    }
+}
+
+fn is_build_dir_name(name: &str) -> bool {
+    let Some(stamp) = name.strip_prefix('b') else {
+        return false;
+    };
+    !stamp.is_empty() && stamp.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// The build id of a stamped index (`xc-<corpus>-b<stamp>-<dataset>`), or
+/// `None` for an unstamped legacy index.
+fn index_build_id(name: &str, index: &str) -> Option<String> {
+    let prefix = stamped_prefix(name, index)?;
+    prefix
+        .strip_prefix(&format!("xc-{name}-"))
+        .map(str::to_string)
+}
+
+struct BuildJournalScan {
+    runs: Vec<(String, String, String)>,
+    generation_pending: bool,
+}
+
+impl BuildJournalScan {
+    fn matches(&self, root: &str, url: &str, prefix: &str) -> bool {
+        !self.runs.is_empty()
+            && self
+                .runs
+                .iter()
+                .all(|(recorded_root, recorded_url, recorded_prefix)| {
+                    recorded_root == root && recorded_url == url && recorded_prefix == prefix
+                })
+    }
+}
+
+/// Read a build journal the way the resume journal does: a trailing line with
+/// no newline is a torn record from a kill and is discarded. A corrupt line
+/// that was newline-terminated is an error — resuming past it would guess.
+fn read_build_journal(path: &Path) -> Result<BuildJournalScan, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("could not read {}: {e}", path.display()))?;
+    let mut lines: Vec<&str> = text.lines().collect();
+    if !text.ends_with('\n') {
+        lines.pop();
+    }
+    let mut scan = BuildJournalScan {
+        runs: Vec::new(),
+        generation_pending: false,
+    };
+    for (i, line) in lines.into_iter().enumerate() {
+        if line.is_empty() {
+            continue;
+        }
+        let value: Value = serde_json::from_str(line).map_err(|e| {
+            format!(
+                "journal line {} of {} is not valid JSON ({e})",
+                i + 1,
+                path.display()
+            )
+        })?;
+        match value.get("kind").and_then(Value::as_str) {
+            Some("run") => scan.runs.push((
+                value
+                    .get("root")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                value
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                value
+                    .get("prefix")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            )),
+            Some("sync_begin") => scan.generation_pending = true,
+            Some("sync_commit") => scan.generation_pending = false,
+            _ => {}
+        }
+    }
+    Ok(scan)
+}
+
+/// The root string autoindex writes into the journal: the canonical corpus
+/// directory, or the path unchanged when canonicalization fails.
+fn corpus_journal_root(corpus_dir: &Path) -> String {
+    corpus_dir
+        .canonicalize()
+        .unwrap_or_else(|_| corpus_dir.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// An unfinished build to resume, or a refusal when more than one journal
+/// could be the one a kill left behind.
+fn find_unfinished_build(
+    state_root: &Path,
+    name: &str,
+    corpus_dir: &Path,
+    url: &str,
+    live_indices: &[String],
+) -> Result<Option<UnfinishedBuild>, String> {
+    let parent = state_root.join(name);
+    let Ok(entries) = std::fs::read_dir(&parent) else {
+        return Ok(None);
+    };
+    let root_str = corpus_journal_root(corpus_dir);
+    let mut matching: std::collections::BTreeMap<String, UnfinishedBuild> =
+        std::collections::BTreeMap::new();
+    // Build ids whose journal does not match this root/url/prefix, but which
+    // the node is already serving. Falling through to legacy mode would
+    // re-hash under another prefix and can retire those indices.
+    let mut foreign_live: Vec<(String, String)> = Vec::new();
+    for entry in entries.flatten() {
+        let fname = entry.file_name().to_string_lossy().into_owned();
+        if !is_build_dir_name(&fname) {
+            continue;
+        }
+        let dir = entry.path();
+        let journal = dir.join("journal.ndjson");
+        if !journal.is_file() {
+            continue;
+        }
+        let prefix = format!("xc-{name}-{fname}");
+        let scan = read_build_journal(&journal).map_err(|reason| {
+            format!(
+                "xerj corpus index: build {fname} of '{name}' has a journal that cannot be \
+                 resumed ({reason}). Nothing was changed. Repair the journal, or build a \
+                 verified replacement with: xerj corpus index {name} --fresh"
+            )
+        })?;
+        if scan.runs.is_empty() {
+            continue;
+        }
+        if scan.matches(&root_str, url, &prefix) {
+            matching.insert(
+                fname.clone(),
+                UnfinishedBuild {
+                    build: fname,
+                    prefix,
+                    state_dir: dir,
+                    generation_pending: scan.generation_pending,
+                },
+            );
+        } else if live_indices
+            .iter()
+            .any(|index| index_build_id(name, index).as_deref() == Some(fname.as_str()))
+        {
+            let recorded_url = scan
+                .runs
+                .first()
+                .map(|(_, recorded, _)| recorded.clone())
+                .unwrap_or_else(|| "(none)".to_string());
+            foreign_live.push((fname, recorded_url));
+        }
+    }
+    let live: std::collections::BTreeSet<String> = live_indices
+        .iter()
+        .filter_map(|index| index_build_id(name, index))
+        .collect();
+    let pool: Vec<UnfinishedBuild> = if live.is_empty() {
+        matching.into_values().collect()
+    } else {
+        matching
+            .into_values()
+            .filter(|build| live.contains(&build.build))
+            .collect()
+    };
+    if pool.is_empty() {
+        if foreign_live.is_empty() {
+            return Ok(None);
+        }
+        foreign_live.sort();
+        let listed = foreign_live
+            .iter()
+            .map(|(build, recorded_url)| format!("{build} (journal url {recorded_url})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(format!(
+            "xerj corpus index: {url} holds indices for unfinished build(s) of '{name}' whose \
+             journal does not match this corpus directory or this url: {listed}. Refusing to \
+             continue in legacy mode — that would re-hash the corpus under another prefix and \
+             can retire this build. Nothing was changed. Re-run with the url the journal was \
+             started against, or build a verified replacement with: xerj corpus index {name} \
+             --fresh"
+        ));
+    }
+    if pool.len() == 1 {
+        return Ok(pool.into_iter().next());
+    }
+    let pending: Vec<UnfinishedBuild> = pool
+        .iter()
+        .filter(|build| build.generation_pending)
+        .cloned()
+        .collect();
+    if pending.len() == 1 {
+        return Ok(pending.into_iter().next());
+    }
+    let listed = pool
+        .iter()
+        .map(|build| build.build.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!(
+        "xerj corpus index: '{name}' has unfinished builds {listed} and this run will not guess \
+         which journal to resume. Nothing was changed. Re-run `xerj corpus index {name} --fresh` \
+         to build a verified replacement beside them, or remove the state directory of the build \
+         you do not want and re-run the same command."
+    ))
+}
+
+/// Continue a build whose journal exists and whose ledger does not name it yet.
+///
+/// A kill during the index phase leaves `sync_begin` (and any committed
+/// operations) in that journal and indices under `xc-<corpus>-b<stamp>`. The
+/// ledger is written only after verification, so the next plain run used to
+/// see "indices exist, no build recorded" and take the legacy arm: a new
+/// prefix, no `--state-dir`, a full re-hash, and a ledger with no
+/// `index_prefix` — the "no verified build recorded" notice.
+fn resume_unfinished_build(
+    node: &dyn CorpusNode,
+    run_autoindex: &dyn Fn(&str, Option<&Path>) -> i32,
+    root: &Path,
+    url: &str,
+    name: &str,
+    unfinished: &UnfinishedBuild,
+) -> i32 {
+    let build = &unfinished.build;
+    let prefix = &unfinished.prefix;
+    let state_dir = &unfinished.state_dir;
+    println!("{}", resume_build_note(name, unfinished));
+    let rc = run_autoindex(prefix, Some(state_dir));
+    let docs = count_under(node, prefix);
+    let queryable = queryable_store(node, name, prefix);
+    let Some(state_dir_str) = state_dir.to_str() else {
+        eprintln!(
+            "xerj corpus index: build {build} resumed (autoindex exit {rc}) but its state \
+             directory {} is not valid Unicode, so the ledger cannot record it. The journal is \
+             unchanged.",
+            state_dir.display()
+        );
+        return if rc == 0 || rc == 3 { 1 } else { rc };
+    };
+    let verdict = resume_verdict(rc, docs, queryable);
+    let record = |salvaged: bool| {
+        let _ = state::write_state(
+            root,
+            name,
+            url,
+            rc as i64,
+            salvaged,
+            Some(build),
+            Some(prefix),
+            Some(state_dir_str),
+        );
+    };
+    match verdict {
+        ResumeVerdict::Verified => {
+            let n = docs.expect("verified verdict has a positive count");
+            warn_short_of_pack_records(name, root, Some(n));
+            record(false);
+            report_leftovers(node, name, root, prefix);
+            report(name, rc, &n.to_string());
+            0
+        }
+        ResumeVerdict::Salvaged => {
+            let n = docs.expect("salvaged verdict has a positive count");
+            eprintln!(
+                "xerj corpus index: WARNING — autoindex exited {rc}, but resumed build {build} \
+                 has {n} records and answers a search. Recording it as UNVERIFIED (salvaged)."
+            );
+            eprintln!(
+                "xerj corpus index: coverage is not guaranteed. Re-run `xerj corpus index \
+                 {name}` to resume the journal, or `xerj corpus index {name} --fresh` for a \
+                 clean build."
+            );
+            record(true);
+            report_leftovers(node, name, root, prefix);
+            report(name, rc, &n.to_string());
+            0
+        }
+        ResumeVerdict::Unverified => {
+            let n = docs.expect("unverified verdict has a positive count");
+            eprintln!(
+                "xerj corpus index: resumed build {build} finished (autoindex exit {rc}, {n} \
+                 records) but the verification search failed. Recording it as UNVERIFIED."
+            );
+            eprintln!(
+                "xerj corpus index: `xerj code` will say the index was not verified complete. \
+                 Re-run `xerj corpus index {name}` to resume the journal at {}.",
+                state_dir.display()
+            );
+            record(true);
+            1
+        }
+        ResumeVerdict::KeepJournal => {
+            let why = match docs {
+                None => "the node did not answer a record count".to_string(),
+                Some(0) => "the node reported 0 records".to_string(),
+                Some(n) => format!(
+                    "{n} records are present, but the store did not answer a search and autoindex \
+                     exited {rc}"
+                ),
+            };
+            eprintln!(
+                "xerj corpus index: resumed build {build} is not verified ({why}; autoindex exit \
+                 {rc})."
+            );
+            eprintln!(
+                "xerj corpus index: nothing was recorded as a verified build, and no ledger \
+                 without a build was written. The journal at {} is kept — re-run `xerj corpus \
+                 index {name}` to resume it. A replacement beside it is `xerj corpus index \
+                 {name} --fresh`.",
+                state_dir.display()
+            );
+            if rc != 0 && rc != 3 {
+                rc
+            } else {
+                1
+            }
+        }
+    }
+}
+
 /// The build/verify/swap flow over an injected node, autoindex runner and
 /// clock (#1004) — the destructive-operation contracts are pinned by the
 /// tests below against a [`FakeNode`](tests::FakeNode), which is why none of
@@ -2003,11 +2586,27 @@ fn corpus_index_flow(
     let old_state_dir = old.as_ref().and_then(|s| s.state_dir.clone());
     let old_url = old.as_ref().and_then(|s| s.url.clone());
 
-    // Which run is this? build (--fresh / first / ledger-names-a-build-this-
-    // node-does-not-hold), update (reconcile the recorded build in place), or
-    // legacy (a corpus indexed before builds existed).
+    // Which run is this?
+    // - build: --fresh, a first index, or a recorded build this node does not hold
+    // - update: reconcile the recorded build in place
+    // - resume: a build was killed before the ledger named it; continue its journal
+    // - legacy: indexed before builds existed (no build journal on disk)
     let mut mode = "legacy";
     let (old_indices, _listed_ok) = corpus_indices(node, name, root);
+    let corpus_dir = root.join("corpora").join(name);
+    // Look only when the ledger does not already name a build. A recorded
+    // build takes the update / #1214 refusal above; --fresh builds a new one.
+    let unfinished = if fresh || old_build.is_some() {
+        None
+    } else {
+        match find_unfinished_build(&state_root, name, &corpus_dir, url, &old_indices) {
+            Ok(found) => found,
+            Err(msg) => {
+                eprintln!("{msg}");
+                return 2;
+            }
+        }
+    };
     if fresh {
         mode = "build";
     } else if old_build.is_some() {
@@ -2070,6 +2669,11 @@ fn corpus_index_flow(
                 mode = "build";
             }
         }
+    } else if unfinished.is_some() {
+        // Indices from the killed run must not select legacy mode. Legacy
+        // opens a different prefix with no state dir, re-hashes the corpus,
+        // and writes a ledger that names no build (#2239).
+        mode = "resume";
     } else if !state_file.exists() && old_indices.is_empty() {
         mode = "build"; // first index of this corpus: same path as --fresh
     }
@@ -2313,6 +2917,12 @@ fn corpus_index_flow(
             report(name, rc, &docs);
             0
         }
+        "resume" => {
+            let unfinished = unfinished
+                .as_ref()
+                .expect("resume mode is set only when an unfinished build was found");
+            resume_unfinished_build(node, run_autoindex, root, url, name, unfinished)
+        }
         _ => {
             // Legacy: recorded before the run so a failure can tell "this run
             // wrote records" apart from "an earlier run's records are still
@@ -2399,14 +3009,42 @@ fn stamp_secs() -> i64 {
 
 // ── xerj corpus list ────────────────────────────────────────────────────────
 
+struct Captured {
+    stdout: String,
+    stderr: String,
+}
+
+fn push_line(buf: &mut String, line: &str) {
+    buf.push_str(line);
+    buf.push('\n');
+}
+
 fn run_corpus_list(args: &[String]) -> i32 {
+    let (code, text) = corpus_list_text(args);
+    if !text.stdout.is_empty() {
+        print!("{}", text.stdout);
+    }
+    if !text.stderr.is_empty() {
+        eprint!("{}", text.stderr);
+    }
+    code
+}
+
+fn corpus_list_text(args: &[String]) -> (i32, Captured) {
     let mut url: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "-h" | "--help" => {
-                println!("{CORPUS_USAGE}");
-                return 0;
+                let mut stdout = String::new();
+                push_line(&mut stdout, CORPUS_USAGE);
+                return (
+                    0,
+                    Captured {
+                        stdout,
+                        stderr: String::new(),
+                    },
+                );
             }
             "--url" => match args.get(i + 1) {
                 Some(v) => {
@@ -2414,13 +3052,33 @@ fn run_corpus_list(args: &[String]) -> i32 {
                     i += 1;
                 }
                 None => {
-                    eprintln!("xerj corpus list: --url needs a value\n\n{CORPUS_USAGE}");
-                    return 2;
+                    let mut stderr = String::new();
+                    push_line(
+                        &mut stderr,
+                        &format!("xerj corpus list: --url needs a value\n\n{CORPUS_USAGE}"),
+                    );
+                    return (
+                        2,
+                        Captured {
+                            stdout: String::new(),
+                            stderr,
+                        },
+                    );
                 }
             },
             a => {
-                eprintln!("xerj corpus list: unexpected argument '{a}'\n\n{CORPUS_USAGE}");
-                return 2;
+                let mut stderr = String::new();
+                push_line(
+                    &mut stderr,
+                    &format!("xerj corpus list: unexpected argument '{a}'\n\n{CORPUS_USAGE}"),
+                );
+                return (
+                    2,
+                    Captured {
+                        stdout: String::new(),
+                        stderr,
+                    },
+                );
             }
         }
         i += 1;
@@ -2428,18 +3086,41 @@ fn run_corpus_list(args: &[String]) -> i32 {
     let root = code_root();
     let state_dir = root.join("state");
     if !state_dir.is_dir() {
-        eprintln!(
-            "no state directory at {} — nothing has been indexed on this machine",
-            state_dir.display()
+        let mut stderr = String::new();
+        push_line(
+            &mut stderr,
+            &format!(
+                "no state directory at {} — nothing has been indexed on this machine",
+                state_dir.display()
+            ),
         );
-        return 2;
+        // The ledger is empty. A node that already has autoindex prefixes
+        // should say so; a node that does not answer adds nothing.
+        push_prefix_hint(&mut stderr, &resolve_url(url.as_deref()));
+        return (
+            2,
+            Captured {
+                stdout: String::new(),
+                stderr,
+            },
+        );
     }
     let url = resolve_url(url.as_deref());
     let es = match build_es(&url, None) {
         Ok(es) => es,
         Err(e) => {
-            eprintln!("xerj corpus list: cannot reach {url}: {e:#}");
-            return 2;
+            let mut stderr = String::new();
+            push_line(
+                &mut stderr,
+                &format!("xerj corpus list: cannot reach {url}: {e:#}"),
+            );
+            return (
+                2,
+                Captured {
+                    stdout: String::new(),
+                    stderr,
+                },
+            );
         }
     };
     let mut names: Vec<String> = std::fs::read_dir(&state_dir)
@@ -2455,12 +3136,13 @@ fn run_corpus_list(args: &[String]) -> i32 {
         })
         .collect();
     names.sort();
+    let mut stdout = String::new();
     let mut loaded = 0usize;
     for name in &names {
         let st = match state::load_state(&root, name) {
             Ok(st) => st,
             Err(e) => {
-                println!("{name}: unreadable state ({e})");
+                push_line(&mut stdout, &format!("{name}: unreadable state ({e})"));
                 continue;
             }
         };
@@ -2485,32 +3167,39 @@ fn run_corpus_list(args: &[String]) -> i32 {
             .and_then(|k| uses.get(k).map(|u| format!("\n  use: {u}")))
             .unwrap_or_default();
         match live {
-            usize::MAX => println!("{name}  (indexed {indexed}, prefix {prefix}) — server unreachable/ambiguous at {url}"),
+            usize::MAX => push_line(&mut stdout, &format!("{name}  (indexed {indexed}, prefix {prefix}) — server unreachable/ambiguous at {url}")),
             0 => {
-                println!("{name}  (indexed {indexed}, prefix {prefix}) — NOT loaded here (0 indices) — stale/other-server{use_note}");
+                push_line(&mut stdout, &format!("{name}  (indexed {indexed}, prefix {prefix}) — NOT loaded here (0 indices) — stale/other-server{use_note}"));
                 // #1846: a name the index prefix rewrites (`curl_cffi`) was
                 // indexed under another spelling, so "0 indices" is not the
                 // whole story — say which name to move it to.
                 if let Err(why) = xccode::pathgate::valid_corpus_name(name) {
-                    println!("  {why}");
+                    push_line(&mut stdout, &format!("  {why}"));
                 }
             }
             n => {
                 loaded += 1;
-                println!("{name}  (indexed {indexed}, prefix {prefix}) — loaded — {n} index(es){use_note}");
+                push_line(&mut stdout, &format!("{name}  (indexed {indexed}, prefix {prefix}) — loaded — {n} index(es){use_note}"));
             }
         }
         if let Some(w) = state::incomplete_coverage(&st) {
-            println!("  {w}");
+            push_line(&mut stdout, &format!("  {w}"));
         }
     }
-    println!();
-    println!(
-        "{} of {} corpora are actually loaded on {url}.",
-        loaded,
-        names.len()
+    stdout.push('\n');
+    push_line(
+        &mut stdout,
+        &format!(
+            "{} of {} corpora are actually loaded on {url}.",
+            loaded,
+            names.len()
+        ),
     );
-    0
+    let mut stderr = String::new();
+    if names.is_empty() {
+        push_prefix_hint(&mut stderr, &url);
+    }
+    (0, Captured { stdout, stderr })
 }
 
 // ── dispatch ────────────────────────────────────────────────────────────────
@@ -3597,6 +4286,453 @@ mod tests {
         assert!(node.ops.borrow().iter().all(|o| !o.starts_with("delete:")));
     }
 
+    /// The journal a `corpus index` kill leaves under `autoindex-state/<name>/<build>`.
+    /// `after_run` is appended after the `run` record (include trailing newlines).
+    /// `torn` appends a partial last line with no newline — the kill's in-flight record.
+    fn write_killed_journal(
+        root: &Path,
+        name: &str,
+        build: &str,
+        url: &str,
+        after_run: &str,
+        torn: bool,
+    ) -> PathBuf {
+        let corpus = root.join("corpora").join(name);
+        let root_str = corpus
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let prefix = format!("xc-{name}-{build}");
+        let dir = root.join("autoindex-state").join(name).join(build);
+        std::fs::create_dir_all(&dir).unwrap();
+        let run = serde_json::json!({
+            "v": 1,
+            "kind": "run",
+            "root": root_str,
+            "url": url,
+            "prefix": prefix,
+            "bulk_timeout_secs": 300,
+            "run_id": format!("run-{build}"),
+            "started": "2026-10-22T00:00:00Z"
+        });
+        let mut text = format!("{run}\n{after_run}");
+        if torn {
+            text.push_str("{\"kind\":\"sync_operation_state\",\"partial\":");
+        }
+        std::fs::write(dir.join("journal.ndjson"), text).unwrap();
+        dir
+    }
+
+    #[test]
+    fn resume_verdict_records_a_clean_build_and_explains_the_rest() {
+        use super::ResumeVerdict::*;
+        assert_eq!(resume_verdict(0, Some(10), true), Verified);
+        assert_eq!(resume_verdict(3, Some(10), true), Verified);
+        assert_eq!(resume_verdict(1, Some(10), true), Salvaged);
+        assert_eq!(resume_verdict(0, Some(10), false), Unverified);
+        // A zero or unknown count must not become a ledger with no build.
+        assert_eq!(resume_verdict(0, Some(0), true), KeepJournal);
+        assert_eq!(resume_verdict(0, None, true), KeepJournal);
+        assert_eq!(resume_verdict(1, Some(0), false), KeepJournal);
+        assert_eq!(resume_verdict(1, None, false), KeepJournal);
+    }
+
+    #[test]
+    fn resume_note_claims_no_rehash_only_when_a_generation_is_pending() {
+        let pending = UnfinishedBuild {
+            build: "b1".into(),
+            prefix: "xc-kv-b1".into(),
+            state_dir: PathBuf::from("/tmp/state"),
+            generation_pending: true,
+        };
+        let note = resume_build_note("kv", &pending);
+        assert!(note.contains("journal"), "{note}");
+        assert!(note.contains("not hashed again"), "{note}");
+        assert!(note.contains("uncommitted"), "{note}");
+
+        let sealed = UnfinishedBuild {
+            generation_pending: false,
+            ..pending
+        };
+        let note = resume_build_note("kv", &sealed);
+        assert!(
+            note.contains("re-hashes"),
+            "a journal with no in-progress generation must not claim the hash is skipped: {note}"
+        );
+        assert!(!note.contains("not hashed again"), "{note}");
+    }
+
+    /// #2239: killed mid-index. The ledger was never written (it is written
+    /// only after verification). The journal holds `sync_begin` and the node
+    /// already has this build's indices. The retry must hand that journal
+    /// back to autoindex — which replays uncommitted operations and does not
+    /// re-enter snapshot/hash — and a resume that then completes must record
+    /// the verified build. The old path took legacy mode (`xc-kv`, no state
+    /// dir) and wrote a ledger with no `index_prefix`.
+    #[test]
+    fn a_kill_mid_index_resumes_the_journal_and_records_a_verified_build() {
+        let root = corpus_root("kv");
+        let state_dir = write_killed_journal(
+            &root,
+            "kv",
+            "b1",
+            "http://x",
+            "{\"kind\":\"sync_begin\"}\n",
+            true,
+        );
+        let node = FakeNode::new();
+        // What the killed run had already published.
+        node.indices.borrow_mut().push("xc-kv-b1-000".into());
+        node.seed_count("xc-kv-b1-*", Count::Number(500));
+
+        let auto = FakeAuto::ok(&node);
+        let rc = run_flow(&node, &auto, &|| T0, &root, "kv", false);
+
+        assert_eq!(rc, 0);
+        assert_eq!(auto.prefixes(), vec!["xc-kv-b1".to_string()]);
+        let (_prefix, sd) = &auto.calls.borrow()[0];
+        assert_eq!(
+            sd.as_deref(),
+            Some(state_dir.as_path()),
+            "resume must pass the killed run's state dir, not start a new journal"
+        );
+        assert!(
+            node.ops
+                .borrow()
+                .iter()
+                .all(|op| !op.starts_with("delete:")),
+            "a resume does not retire the indices the killed run already wrote"
+        );
+        let st = state::load_state(&root, "kv").unwrap();
+        assert_eq!(st.build.as_deref(), Some("b1"));
+        assert_eq!(st.index_prefix.as_deref(), Some("xc-kv-b1"));
+        assert_eq!(st.state_dir.as_deref(), state_dir.to_str());
+        assert_eq!(st.salvaged, Some(false));
+        assert_eq!(st.autoindex_exit, Some(serde_json::json!(0)));
+        assert!(
+            state::incomplete_coverage(&st).is_none(),
+            "a clean resume is a verified build"
+        );
+        // The torn tail must not have hidden sync_begin: that flag is what
+        // tells the resume it can continue mid-index instead of re-hashing.
+        let scan = read_build_journal(&state_dir.join("journal.ndjson")).unwrap();
+        assert!(
+            scan.generation_pending,
+            "a kill's torn last line is discarded; sync_begin still means the index phase"
+        );
+        assert!(scan.matches(
+            &corpus_journal_root(&root.join("corpora/kv")),
+            "http://x",
+            "xc-kv-b1"
+        ));
+    }
+
+    /// Same kill, but the store answers a count and not a search. The build
+    /// is recorded so status can explain why it is unverified, instead of
+    /// widening to "no verified build recorded".
+    #[test]
+    fn a_resumed_build_the_node_cannot_search_is_recorded_unverified() {
+        let root = corpus_root("kv");
+        let state_dir = write_killed_journal(
+            &root,
+            "kv",
+            "b1",
+            "http://x",
+            "{\"kind\":\"sync_begin\"}\n",
+            false,
+        );
+        let node = FakeNode::new();
+        node.indices.borrow_mut().push("xc-kv-b1-000".into());
+        node.seed_count("xc-kv-b1-*", Count::Number(500));
+        node.seed_search(
+            "xc-kv-b1-*",
+            Err("HTTP 500: store_exception: Segment ea12 not found".into()),
+        );
+
+        let auto = FakeAuto::ok(&node);
+        let rc = run_flow(&node, &auto, &|| T0, &root, "kv", false);
+
+        assert_eq!(rc, 1, "a failed verification search is not success");
+        assert_eq!(auto.prefixes(), vec!["xc-kv-b1".to_string()]);
+        let st = state::load_state(&root, "kv").unwrap();
+        assert_eq!(st.index_prefix.as_deref(), Some("xc-kv-b1"));
+        assert_eq!(st.build.as_deref(), Some("b1"));
+        assert_eq!(st.salvaged, Some(true));
+        assert_eq!(st.state_dir.as_deref(), state_dir.to_str());
+        let warning = state::incomplete_coverage(&st).expect("unverified status");
+        assert!(
+            warning.contains("NOT verified complete") && warning.contains("kept unverified"),
+            "{warning}"
+        );
+        assert!(node.live("xc-kv-b1-000"));
+        assert!(node
+            .ops
+            .borrow()
+            .iter()
+            .all(|op| !op.starts_with("delete:")));
+    }
+
+    /// Autoindex itself failed and the node has nothing new to stand on.
+    /// Do not write the legacy ledger (no build) that the notice complains about.
+    #[test]
+    fn a_failed_resume_keeps_the_journal_and_writes_no_buildless_ledger() {
+        let root = corpus_root("kv");
+        let state_dir = write_killed_journal(
+            &root,
+            "kv",
+            "b1",
+            "http://x",
+            "{\"kind\":\"sync_begin\"}\n",
+            false,
+        );
+        let node = FakeNode::new();
+        node.indices.borrow_mut().push("xc-kv-b1-000".into());
+        node.seed_count("xc-kv-b1-*", Count::Zero);
+
+        let auto = FakeAuto::with_rc(&node, 1);
+        let rc = run_flow(&node, &auto, &|| T0, &root, "kv", false);
+
+        assert_eq!(rc, 1);
+        assert_eq!(auto.prefixes(), vec!["xc-kv-b1".to_string()]);
+        assert_eq!(
+            auto.calls.borrow()[0].1.as_deref(),
+            Some(state_dir.as_path())
+        );
+        assert!(
+            state::load_state(&root, "kv").is_err(),
+            "a failed resume must not write a ledger that names no build"
+        );
+        assert!(
+            state_dir.join("journal.ndjson").is_file(),
+            "the journal remains the next resume point"
+        );
+    }
+
+    /// Killed during snapshot, before any index existed: still the same state
+    /// dir, not a freshly minted build that abandons the sealed snapshot.
+    #[test]
+    fn a_kill_before_any_index_resumes_the_same_build_directory() {
+        let root = corpus_root("kv");
+        let state_dir = write_killed_journal(&root, "kv", "b9", "http://x", "", false);
+        let node = FakeNode::new();
+        let auto = FakeAuto::ok(&node);
+        let rc = run_flow(&node, &auto, &|| T0, &root, "kv", false);
+
+        assert_eq!(rc, 0);
+        assert_eq!(auto.prefixes(), vec!["xc-kv-b9".to_string()]);
+        assert_eq!(
+            auto.calls.borrow()[0].1.as_deref(),
+            Some(state_dir.as_path())
+        );
+        let st = state::load_state(&root, "kv").unwrap();
+        assert_eq!(st.index_prefix.as_deref(), Some("xc-kv-b9"));
+        assert_eq!(st.salvaged, Some(false));
+        let note = resume_build_note(
+            "kv",
+            &UnfinishedBuild {
+                build: "b9".into(),
+                prefix: "xc-kv-b9".into(),
+                state_dir: state_dir.clone(),
+                generation_pending: false,
+            },
+        );
+        assert!(note.contains("re-hashes"), "{note}");
+    }
+
+    #[test]
+    fn a_first_index_with_no_journal_still_mints_a_build() {
+        let root = corpus_root("kv");
+        let node = FakeNode::new();
+        let auto = FakeAuto::ok(&node);
+        assert_eq!(run_flow(&node, &auto, &|| T0, &root, "kv", false), 0);
+        assert_eq!(auto.prefixes(), vec![format!("xc-kv-b{T0}")]);
+        let st = state::load_state(&root, "kv").unwrap();
+        assert_eq!(
+            st.index_prefix.as_deref(),
+            Some(format!("xc-kv-b{T0}").as_str())
+        );
+        assert_eq!(st.salvaged, Some(false));
+    }
+
+    #[test]
+    fn fresh_ignores_an_unfinished_journal_and_builds_a_new_one() {
+        let root = corpus_root("kv");
+        write_killed_journal(
+            &root,
+            "kv",
+            "b1",
+            "http://x",
+            "{\"kind\":\"sync_begin\"}\n",
+            false,
+        );
+        let node = FakeNode::new();
+        node.indices.borrow_mut().push("xc-kv-b1-000".into());
+        node.seed_count("xc-kv-b1-*", Count::Number(500));
+        let auto = FakeAuto::ok(&node);
+        let rc = run_flow(&node, &auto, &|| T0, &root, "kv", true);
+
+        assert_eq!(rc, 0);
+        assert_eq!(auto.prefixes(), vec![format!("xc-kv-b{T0}")]);
+        let st = state::load_state(&root, "kv").unwrap();
+        assert_eq!(
+            st.index_prefix.as_deref(),
+            Some(format!("xc-kv-b{T0}").as_str())
+        );
+        assert!(!node.live("xc-kv-b1-000"), "fresh retires the killed build");
+    }
+
+    #[test]
+    fn two_pending_journals_are_refused_instead_of_guessing() {
+        let root = corpus_root("kv");
+        write_killed_journal(
+            &root,
+            "kv",
+            "b1",
+            "http://x",
+            "{\"kind\":\"sync_begin\"}\n",
+            false,
+        );
+        write_killed_journal(
+            &root,
+            "kv",
+            "b2",
+            "http://x",
+            "{\"kind\":\"sync_begin\"}\n",
+            false,
+        );
+        let node = FakeNode::new();
+        node.indices
+            .borrow_mut()
+            .extend(["xc-kv-b1-000".into(), "xc-kv-b2-000".into()]);
+        let auto = FakeAuto::ok(&node);
+        let rc = run_flow(&node, &auto, &|| T0, &root, "kv", false);
+
+        assert_eq!(rc, 2);
+        assert!(auto.calls.borrow().is_empty());
+        assert!(node
+            .ops
+            .borrow()
+            .iter()
+            .all(|op| !op.starts_with("delete:")));
+        assert!(state::load_state(&root, "kv").is_err());
+    }
+
+    #[test]
+    fn a_single_pending_journal_wins_over_another_finished_attempt() {
+        let root = corpus_root("kv");
+        let pending = write_killed_journal(
+            &root,
+            "kv",
+            "b2",
+            "http://x",
+            "{\"kind\":\"sync_begin\"}\n",
+            false,
+        );
+        write_killed_journal(
+            &root,
+            "kv",
+            "b1",
+            "http://x",
+            "{\"kind\":\"sync_begin\"}\n{\"kind\":\"sync_commit\"}\n",
+            false,
+        );
+        let node = FakeNode::new();
+        let auto = FakeAuto::ok(&node);
+        let rc = run_flow(&node, &auto, &|| T0, &root, "kv", false);
+
+        assert_eq!(rc, 0);
+        assert_eq!(auto.prefixes(), vec!["xc-kv-b2".to_string()]);
+        assert_eq!(auto.calls.borrow()[0].1.as_deref(), Some(pending.as_path()));
+    }
+
+    #[test]
+    fn live_indices_select_the_build_that_was_being_published() {
+        let root = corpus_root("kv");
+        write_killed_journal(
+            &root,
+            "kv",
+            "b1",
+            "http://x",
+            "{\"kind\":\"sync_begin\"}\n",
+            false,
+        );
+        let live = write_killed_journal(
+            &root,
+            "kv",
+            "b2",
+            "http://x",
+            "{\"kind\":\"sync_begin\"}\n",
+            false,
+        );
+        let node = FakeNode::new();
+        node.indices.borrow_mut().push("xc-kv-b2-000".into());
+        node.seed_count("xc-kv-b2-*", Count::Number(40));
+        let auto = FakeAuto::ok(&node);
+        let rc = run_flow(&node, &auto, &|| T0, &root, "kv", false);
+
+        assert_eq!(rc, 0);
+        assert_eq!(auto.prefixes(), vec!["xc-kv-b2".to_string()]);
+        assert_eq!(auto.calls.borrow()[0].1.as_deref(), Some(live.as_path()));
+        assert!(node.live("xc-kv-b2-000"));
+    }
+
+    #[test]
+    fn a_journal_for_another_url_is_not_resumed_over_its_live_indices() {
+        let root = corpus_root("kv");
+        write_killed_journal(
+            &root,
+            "kv",
+            "b1",
+            "http://elsewhere",
+            "{\"kind\":\"sync_begin\"}\n",
+            false,
+        );
+        let node = FakeNode::new();
+        node.indices.borrow_mut().push("xc-kv-b1-000".into());
+        node.seed_count("xc-kv-b1-*", Count::Number(500));
+        let auto = FakeAuto::ok(&node);
+        let rc = run_flow(&node, &auto, &|| T0, &root, "kv", false);
+
+        assert_eq!(rc, 2, "legacy mode would re-hash and can retire this build");
+        assert!(auto.calls.borrow().is_empty());
+        assert!(node.live("xc-kv-b1-000"));
+        assert!(node
+            .ops
+            .borrow()
+            .iter()
+            .all(|op| !op.starts_with("delete:")));
+    }
+
+    #[test]
+    fn a_corrupt_build_journal_is_refused() {
+        let root = corpus_root("kv");
+        let dir = write_killed_journal(
+            &root,
+            "kv",
+            "b1",
+            "http://x",
+            "{\"kind\":\"sync_begin\"}\n",
+            false,
+        );
+        std::fs::write(
+            dir.join("journal.ndjson"),
+            "{\"kind\":\"run\"}\n{not json}\n",
+        )
+        .unwrap();
+        let node = FakeNode::new();
+        node.indices.borrow_mut().push("xc-kv-b1-000".into());
+        let auto = FakeAuto::ok(&node);
+        let rc = run_flow(&node, &auto, &|| T0, &root, "kv", false);
+        assert_eq!(rc, 2);
+        assert!(auto.calls.borrow().is_empty());
+        assert!(node
+            .ops
+            .borrow()
+            .iter()
+            .all(|op| !op.starts_with("delete:")));
+    }
+
     #[test]
     fn a_legacy_run_retires_stamped_generations_it_cannot_reach() {
         let root = corpus_root("kv");
@@ -4264,6 +5400,456 @@ precedence = ["a", "b"]
             !pinned.join(".xerjignore").exists(),
             "a pinned rebuild stays at the recorded sha and does not copy the working tree's .xerjignore"
         );
+    }
+
+    // ── empty ledger vs autoindex prefixes (#2181) ──────────────────────────
+
+    fn catalog_hits(prefixes: &[&str]) -> String {
+        let hits: Vec<Value> = prefixes
+            .iter()
+            .map(|prefix| json!({"_source": {"doc_kind": "run", "prefix": prefix}}))
+            .collect();
+        json!({"hits": {"hits": hits}}).to_string()
+    }
+
+    /// One-shot JSON stand-in for the node. Records each request so a test
+    /// can see that a path with corpora never asked the catalog.
+    struct JsonServer {
+        url: String,
+        seen: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        join: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl JsonServer {
+        fn start(handler: impl Fn(&str) -> (u16, String) + Send + Sync + 'static) -> Self {
+            use std::io::{Read, Write};
+            use std::net::TcpListener;
+            use std::sync::atomic::Ordering;
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let seen_t = std::sync::Arc::clone(&seen);
+            let stop_t = std::sync::Arc::clone(&stop);
+            let handler = std::sync::Arc::new(handler);
+            let join = std::thread::spawn(move || {
+                while !stop_t.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            stream.set_nonblocking(false).unwrap();
+                            let _ =
+                                stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+                            let mut buf = [0u8; 8192];
+                            let mut req = String::new();
+                            loop {
+                                match stream.read(&mut buf) {
+                                    Ok(0) => break,
+                                    Ok(n) => {
+                                        req.push_str(&String::from_utf8_lossy(&buf[..n]));
+                                        if let Some(end) = req.find("\r\n\r\n") {
+                                            let header_end = end + 4;
+                                            let need = req[..header_end].lines().find_map(|line| {
+                                                let (name, value) = line.split_once(':')?;
+                                                if name.eq_ignore_ascii_case("content-length") {
+                                                    value.trim().parse::<usize>().ok()
+                                                } else {
+                                                    None
+                                                }
+                                            });
+                                            match need {
+                                                Some(need) if req.len() - header_end >= need => {
+                                                    break
+                                                }
+                                                None => break,
+                                                Some(_) => {}
+                                            }
+                                        }
+                                        if req.len() > 64 * 1024 {
+                                            break;
+                                        }
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                            seen_t.lock().unwrap().push(req.clone());
+                            let (status, body) = handler(&req);
+                            let reason = match status {
+                                200 => "OK",
+                                401 => "Unauthorized",
+                                404 => "Not Found",
+                                _ => "Error",
+                            };
+                            let bytes = format!(
+                                "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            let _ = stream.write_all(bytes.as_bytes());
+                            let _ = stream.flush();
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            Self {
+                url,
+                seen,
+                stop,
+                join: Some(join),
+            }
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for JsonServer {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(join) = self.join.take() {
+                let _ = join.join();
+            }
+        }
+    }
+
+    fn closed_port_url() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        url
+    }
+
+    fn assert_fast(started: std::time::Instant, what: &str) {
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "{what} took {elapsed:?}; a dead node must not go through Es::search's six retries"
+        );
+    }
+
+    #[test]
+    fn prefix_hint_names_the_search_and_def_commands_and_corpus_add() {
+        let one = format_autoindex_prefix_hint(&["proj".into()]).unwrap();
+        assert!(one.contains("prefixes: proj\n"), "{one}");
+        assert!(one.contains("`xerj search --prefix proj`"), "{one}");
+        assert!(one.contains("`xerj def --prefix proj`"), "{one}");
+        assert!(one.contains("`xerj corpus add <name> <path>`"), "{one}");
+        assert!(!one.contains("same --prefix"), "{one}");
+        assert_eq!(one.lines().count(), 2, "{one}");
+
+        let many = format_autoindex_prefix_hint(&["refs".into(), "proj".into()]).unwrap();
+        assert!(many.contains("prefixes: proj, refs"), "{many}");
+        assert!(many.contains("`xerj search --prefix proj`"), "{many}");
+        assert!(many.contains("same --prefix for each"), "{many}");
+
+        let mut nine: Vec<String> = (b'a'..=b'i').map(|c| (c as char).to_string()).collect();
+        nine.push("bad name".into());
+        nine.push("has\nnewline".into());
+        let capped = format_autoindex_prefix_hint(&nine).unwrap();
+        assert!(capped.contains("… (1 more)"), "{capped}");
+        assert!(capped.contains("`xerj search --prefix a`"), "{capped}");
+        assert!(!capped.contains("bad name"), "{capped}");
+        assert!(!capped.contains("has\nnewline"), "{capped}");
+        assert_eq!(capped.lines().count(), 2, "{capped}");
+
+        assert!(format_autoindex_prefix_hint(&[]).is_none());
+        assert!(format_autoindex_prefix_hint(&["bad name".into()]).is_none());
+    }
+
+    #[test]
+    fn catalog_hit_prefixes_are_deduped_and_a_non_search_body_is_not_empty() {
+        let v = json!({"hits": {"hits": [
+            {"_source": {"prefix": "b"}},
+            {"_source": {"prefix": ""}},
+            {"_source": {"prefix": "a"}},
+            {"_source": {"prefix": "a"}},
+            {"_source": {"other": 1}}
+        ]}});
+        assert_eq!(
+            prefixes_from_catalog_hits(&v).unwrap(),
+            vec!["a".to_string(), "b".to_string()]
+        );
+        assert!(prefixes_from_catalog_hits(&json!({})).is_none());
+        assert_eq!(
+            prefixes_from_catalog_hits(&json!({"hits": {"hits": []}})).unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn an_unreachable_catalog_is_silence_not_an_error() {
+        let url = closed_port_url();
+        let started = std::time::Instant::now();
+        assert!(fetch_catalog_run_prefixes(&url, None).is_none());
+        assert_fast(started, "closed port");
+
+        let server = JsonServer::start(|_| (500, "{\"error\":\"down\"}".into()));
+        assert!(catalog_prefix_hint(&server.url, None).is_none());
+        let server = JsonServer::start(|_| (200, "not-json".into()));
+        assert!(fetch_catalog_run_prefixes(&server.url, None).is_none());
+        let server = JsonServer::start(|_| (200, "{\"hits\":{\"hits\":[]}}".into()));
+        assert!(catalog_prefix_hint(&server.url, None).is_none());
+        let server = JsonServer::start(|_| (401, "{}".into()));
+        assert!(catalog_prefix_hint(&server.url, Some("nope")).is_none());
+    }
+
+    fn request_has_api_key(req: &str, key: &str) -> bool {
+        let want = format!("ApiKey {key}");
+        req.lines().any(|line| {
+            let Some((name, value)) = line.split_once(':') else {
+                return false;
+            };
+            name.trim().eq_ignore_ascii_case("authorization") && value.trim() == want
+        })
+    }
+
+    #[test]
+    fn the_hint_sends_the_explicit_api_key() {
+        let server = JsonServer::start(|req| {
+            if request_has_api_key(req, "secret-key") {
+                (200, catalog_hits(&["proj"]))
+            } else {
+                (401, "{}".into())
+            }
+        });
+        let hint = catalog_prefix_hint(&server.url, Some("secret-key")).unwrap();
+        assert!(hint.contains("prefixes: proj"), "{hint}");
+        assert!(
+            server
+                .requests()
+                .iter()
+                .any(|req| request_has_api_key(req, "secret-key")),
+            "{:?}",
+            server.requests()
+        );
+    }
+
+    #[test]
+    fn corpus_list_with_no_ledger_names_catalog_prefixes() {
+        let server = JsonServer::start(|_| (200, catalog_hits(&["refs", "proj", "proj"])));
+        let home = tempfile::tempdir().unwrap();
+        let _hold = code_home(home.path());
+        let (code, text) = corpus_list_text(&["--url".into(), server.url.clone()]);
+        assert_eq!(code, 2);
+        assert!(text.stdout.is_empty(), "{}", text.stdout);
+        assert!(
+            text.stderr
+                .contains("nothing has been indexed on this machine"),
+            "{}",
+            text.stderr
+        );
+        assert!(
+            text.stderr.contains("prefixes: proj, refs"),
+            "{}",
+            text.stderr
+        );
+        assert!(
+            text.stderr.contains("`xerj search --prefix proj`"),
+            "{}",
+            text.stderr
+        );
+        assert!(
+            text.stderr.contains("`xerj def --prefix proj`"),
+            "{}",
+            text.stderr
+        );
+        assert!(
+            text.stderr.contains("`xerj corpus add <name> <path>`"),
+            "{}",
+            text.stderr
+        );
+
+        std::fs::create_dir_all(home.path().join("state")).unwrap();
+        let (code, text) = corpus_list_text(&["--url".into(), server.url.clone()]);
+        assert_eq!(code, 0, "{}", text.stderr);
+        assert!(
+            text.stdout.contains("0 of 0 corpora are actually loaded"),
+            "{}",
+            text.stdout
+        );
+        assert!(
+            text.stderr.contains("prefixes: proj, refs"),
+            "{}",
+            text.stderr
+        );
+    }
+
+    #[test]
+    fn corpus_list_stays_quiet_when_the_node_is_down() {
+        let url = closed_port_url();
+        let home = tempfile::tempdir().unwrap();
+        let _hold = code_home(home.path());
+        let started = std::time::Instant::now();
+        let (code, text) = corpus_list_text(&["--url".into(), url.clone()]);
+        assert_fast(started, "corpus list, no state dir");
+        assert_eq!(code, 2);
+        assert!(
+            text.stderr
+                .contains("nothing has been indexed on this machine"),
+            "{}",
+            text.stderr
+        );
+        assert!(
+            !text.stderr.contains("autoindex catalog"),
+            "{}",
+            text.stderr
+        );
+        assert!(!text.stderr.contains("cannot reach"), "{}", text.stderr);
+
+        std::fs::create_dir_all(home.path().join("state")).unwrap();
+        let started = std::time::Instant::now();
+        let (code, text) = corpus_list_text(&["--url".into(), url]);
+        assert_fast(started, "corpus list, empty state dir");
+        assert_eq!(code, 0, "{}", text.stderr);
+        assert!(
+            text.stdout.contains("0 of 0 corpora are actually loaded"),
+            "{}",
+            text.stdout
+        );
+        assert!(text.stderr.is_empty(), "{}", text.stderr);
+    }
+
+    #[test]
+    fn corpus_list_with_a_corpus_does_not_mention_autoindex_prefixes() {
+        let server = JsonServer::start(|req| {
+            if req.contains("/_cat/indices/") {
+                (200, r#"[{"index":"xc-demo-b1-docs"}]"#.into())
+            } else if req.contains("autoindex-catalog") {
+                (200, catalog_hits(&["proj"]))
+            } else {
+                (404, "{}".into())
+            }
+        });
+        let home = tempfile::tempdir().unwrap();
+        let _hold = code_home(home.path());
+        let state = home.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(
+            state.join("demo.json"),
+            r#"{"corpus":"demo","indexed_at":"2026-01-02T03:04:05Z","prefix":"xc-demo","autoindex_exit":0,"salvaged":false}"#,
+        )
+        .unwrap();
+        let (code, text) = corpus_list_text(&["--url".into(), server.url.clone()]);
+        assert_eq!(code, 0, "{}", text.stderr);
+        assert!(text.stdout.contains("demo"), "{}", text.stdout);
+        assert!(text.stdout.contains("loaded — 1 index"), "{}", text.stdout);
+        assert!(
+            text.stdout.contains("1 of 1 corpora are actually loaded"),
+            "{}",
+            text.stdout
+        );
+        assert!(
+            !text.stderr.contains("autoindex catalog"),
+            "{}",
+            text.stderr
+        );
+        assert!(
+            !text.stdout.contains("autoindex catalog"),
+            "{}",
+            text.stdout
+        );
+        let seen = server.requests();
+        assert!(
+            seen.iter().all(|req| !req.contains("autoindex-catalog")),
+            "a ledger that has a corpus must not read the catalog: {seen:?}"
+        );
+    }
+
+    #[test]
+    fn xerj_code_on_an_empty_ledger_names_catalog_prefixes() {
+        let server = JsonServer::start(|_| (200, catalog_hits(&["proj"])));
+        let home = tempfile::tempdir().unwrap();
+        let _hold = code_home(home.path());
+        let done = code_cli_outcome(&[
+            "proj".into(),
+            "how does it flush".into(),
+            "--url".into(),
+            server.url.clone(),
+        ]);
+        let CodeCliDone::Outcome(out) = done else {
+            panic!("usage path");
+        };
+        assert_eq!(out.exit, 2);
+        assert!(out.to_stderr);
+        assert!(
+            out.text.contains("corpus 'proj' is not indexed"),
+            "{}",
+            out.text
+        );
+        assert!(
+            out.text.contains("`xerj search --prefix proj`"),
+            "{}",
+            out.text
+        );
+        assert!(
+            out.text.contains("`xerj def --prefix proj`"),
+            "{}",
+            out.text
+        );
+        assert!(
+            out.text.contains("`xerj corpus add <name> <path>`"),
+            "{}",
+            out.text
+        );
+
+        // A different registered corpus means the ledger is not empty: the
+        // missing name keeps its own refusal and the catalog is not read.
+        std::fs::create_dir_all(home.path().join("state")).unwrap();
+        std::fs::write(
+            home.path().join("state/other.json"),
+            r#"{"corpus":"other","indexed_at":"2026-01-02T03:04:05Z","prefix":"xc-other"}"#,
+        )
+        .unwrap();
+        let before = server.requests().len();
+        let done = code_cli_outcome(&[
+            "proj".into(),
+            "how does it flush".into(),
+            "--url".into(),
+            server.url.clone(),
+        ]);
+        let CodeCliDone::Outcome(out) = done else {
+            panic!("usage path");
+        };
+        assert_eq!(out.exit, 2);
+        assert!(
+            out.text.contains("corpus 'proj' is not indexed"),
+            "{}",
+            out.text
+        );
+        assert!(!out.text.contains("autoindex catalog"), "{}", out.text);
+        assert_eq!(
+            server.requests().len(),
+            before,
+            "a non-empty ledger must not probe the catalog"
+        );
+        drop(_hold);
+
+        let url = closed_port_url();
+        let empty = tempfile::tempdir().unwrap();
+        let _hold_empty = code_home(empty.path());
+        let started = std::time::Instant::now();
+        let done = code_cli_outcome(&[
+            "proj".into(),
+            "how does it flush".into(),
+            "--url".into(),
+            url,
+        ]);
+        assert_fast(started, "xerj code, dead node");
+        let CodeCliDone::Outcome(out) = done else {
+            panic!("usage path");
+        };
+        assert_eq!(out.exit, 2);
+        assert!(
+            out.text.contains("corpus 'proj' is not indexed"),
+            "{}",
+            out.text
+        );
+        assert!(!out.text.contains("autoindex catalog"), "{}", out.text);
     }
 
     fn worktree_files(root: &Path) -> Vec<String> {

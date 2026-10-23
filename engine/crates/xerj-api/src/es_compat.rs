@@ -11,7 +11,7 @@ use axum::{
     Json,
 };
 use chrono::{Datelike, TimeZone, Timelike, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
@@ -1415,6 +1415,62 @@ pub struct EsCreateIndexMappings {
     pub properties: Option<Value>,
 }
 
+/// Display-side settings blob stored for `GET /{index}/_settings` at create.
+///
+/// `None` when the request carried neither settings nor an index-sort
+/// decision — the single-node path then leaves `index_settings` untouched.
+fn create_time_index_settings(
+    body_settings: Option<&Value>,
+    explicit_sort_field: &Option<String>,
+    explicit_sort_order: &str,
+    declared_timestamp_date: bool,
+) -> Option<Value> {
+    if let Some(settings) = body_settings {
+        let mut s = settings.clone();
+        if let Some(f) = explicit_sort_field.as_ref() {
+            if let Some(o) = s.as_object_mut() {
+                o.insert("__xy_index_sort_field".to_string(), json!(f));
+                o.insert(
+                    "__xy_index_sort_order".to_string(),
+                    json!(explicit_sort_order),
+                );
+                o.insert("__xy_index_sort_explicit".to_string(), json!(true));
+            }
+        } else if declared_timestamp_date {
+            if let Some(o) = s.as_object_mut() {
+                o.insert("__xy_index_sort_field".to_string(), json!("@timestamp"));
+                o.insert("__xy_index_sort_order".to_string(), json!("desc"));
+            }
+        }
+        return Some(s);
+    }
+    if let Some(f) = explicit_sort_field.as_ref() {
+        return Some(json!({
+            "__xy_index_sort_field": f,
+            "__xy_index_sort_order": explicit_sort_order,
+            "__xy_index_sort_explicit": true,
+        }));
+    }
+    if declared_timestamp_date {
+        return Some(json!({
+            "__xy_index_sort_field": "@timestamp",
+            "__xy_index_sort_order": "desc",
+        }));
+    }
+    None
+}
+
+/// Alias map with date-math names resolved. `None` when the body has no
+/// `aliases` object.
+fn resolved_create_aliases(body: &Value) -> Option<serde_json::Map<String, Value>> {
+    let aliases = body.get("aliases")?.as_object()?;
+    let mut resolved = serde_json::Map::new();
+    for (alias, opts) in aliases {
+        resolved.insert(resolve_date_math_index(alias), opts.clone());
+    }
+    Some(resolved)
+}
+
 pub async fn create_index(
     State(state): State<AppState>,
     Path(index): Path<String>,
@@ -1535,6 +1591,41 @@ pub async fn create_index(
     // indices at a single WAL file descriptor). create_index_with_settings
     // applies index templates identically to create_index.
     let create_settings = body.get("settings").cloned().unwrap_or(Value::Null);
+    let display_settings = create_time_index_settings(
+        body.get("settings"),
+        &explicit_sort_field,
+        &explicit_sort_order,
+        declared_timestamp_date,
+    );
+    let resolved_aliases = resolved_create_aliases(&body);
+
+    // Cluster members replicate the create. The accepting node evaluates
+    // templates and date-math aliases; peers apply that result. ILM attach
+    // stays on this node either way — it is not in the log.
+    if state.engine.has_cluster() {
+        let spec = xerj_engine::ReplicatedIndexSpec {
+            name: index.clone(),
+            schema,
+            settings: create_settings,
+            mappings: mappings_val,
+            index_settings: display_settings.unwrap_or(Value::Null),
+            aliases: resolved_aliases
+                .clone()
+                .map(Value::Object)
+                .unwrap_or(Value::Null),
+        };
+        return match state.engine.replicate_index_create(spec).await {
+            Ok(()) => {
+                if let Some(Some(policy_name)) = ilm_lifecycle_directive_from_settings(&body) {
+                    let _ = crate::ism_api::attach_policy(&state, &index, &policy_name).await;
+                }
+                let resp = EsIndexResponse::ok(&index);
+                (StatusCode::OK, Json(resp)).into_response()
+            }
+            Err(e) => ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+        };
+    }
+
     match state
         .engine
         .create_index_with_settings(&index, schema, create_settings)
@@ -1543,44 +1634,8 @@ pub async fn create_index(
             // Store the raw settings / mappings / aliases blob as written.
             // These are used by `GET /{index}/_settings`, `GET /{index}/_mapping`,
             // `GET /{index}`, and cluster health replica checks.
-            if let Some(settings) = body.get("settings") {
-                let mut s = settings.clone();
-                if let Some(f) = explicit_sort_field.as_ref() {
-                    if let Some(o) = s.as_object_mut() {
-                        o.insert("__xy_index_sort_field".to_string(), json!(f));
-                        o.insert(
-                            "__xy_index_sort_order".to_string(),
-                            json!(explicit_sort_order),
-                        );
-                        // Mark this as an EXPLICIT index sort (vs the
-                        // @timestamp auto-heuristic) so the search path can
-                        // map a lone `_doc` sort onto the index-sort field.
-                        o.insert("__xy_index_sort_explicit".to_string(), json!(true));
-                    }
-                } else if declared_timestamp_date {
-                    if let Some(o) = s.as_object_mut() {
-                        o.insert("__xy_index_sort_field".to_string(), json!("@timestamp"));
-                        o.insert("__xy_index_sort_order".to_string(), json!("desc"));
-                    }
-                }
+            if let Some(s) = display_settings {
                 state.engine.index_settings.insert(index.clone(), s);
-            } else if let Some(f) = explicit_sort_field.as_ref() {
-                state.engine.index_settings.insert(
-                    index.clone(),
-                    json!({
-                        "__xy_index_sort_field": f,
-                        "__xy_index_sort_order": explicit_sort_order,
-                        "__xy_index_sort_explicit": true,
-                    }),
-                );
-            } else if declared_timestamp_date {
-                state.engine.index_settings.insert(
-                    index.clone(),
-                    json!({
-                        "__xy_index_sort_field": "@timestamp",
-                        "__xy_index_sort_order": "desc",
-                    }),
-                );
             }
             if !mappings_val.is_null() {
                 // Persists es_mapping.json into the index dir (atomic) so
@@ -1589,16 +1644,13 @@ pub async fn create_index(
                     return ApiError::new(xerj_common::XerjError::from(error)).into_response();
                 }
             }
-            if let Some(aliases) = body.get("aliases").and_then(Value::as_object) {
+            if let Some(resolved_aliases) = resolved_aliases {
                 // Alias keys can also contain date math
                 // (`<logs_{now/d}>` → `logs_2026-04-19`). Resolve each
                 // before storing / registering. The meta map keys use the
                 // resolved name so GET /_alias round-trips correctly.
-                let mut resolved_aliases = serde_json::Map::new();
-                for (alias, opts) in aliases {
-                    let resolved = resolve_date_math_index(alias);
-                    resolved_aliases.insert(resolved.clone(), opts.clone());
-                    if let Err(error) = state.engine.add_alias(&resolved, &index) {
+                for alias in resolved_aliases.keys() {
+                    if let Err(error) = state.engine.add_alias(alias, &index) {
                         return ApiError::new(xerj_common::XerjError::from(error)).into_response();
                     }
                 }
@@ -3223,6 +3275,19 @@ pub async fn put_mapping(
         plans.push((idx_name.clone(), idx, existing, additions));
     }
 
+    if state.engine.has_cluster() {
+        for (idx_name, _, existing, additions) in plans {
+            if let Err(error) = state
+                .engine
+                .replicate_mapping(&idx_name, &existing, &additions)
+                .await
+            {
+                return ApiError::new(xerj_common::XerjError::from(error)).into_response();
+            }
+        }
+        return Json(json!({ "acknowledged": true })).into_response();
+    }
+
     // Publication begins only after every deterministic candidate has passed.
     // `add_fields` repeats engine-side validation defensively. Concurrent
     // schema evolution and filesystem failures still require a broader
@@ -3846,12 +3911,36 @@ pub async fn index_doc_auto(
         Err(resp) => return resp,
     };
 
-    let idx = match state.engine.get_or_create_index(&index) {
-        Ok(i) => i,
-        Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+    // Cluster mode picks the id before routing so the shard owner is a
+    // function of the id that will be stored. Single-node keeps the engine's
+    // auto-id.
+    let preset_id = if state.engine.has_cluster() {
+        let id = uuid::Uuid::new_v4().to_string();
+        match crate::cluster_shard::dispatch_index(
+            &state, &index, &id, &doc, "index", None, None, None, None,
+        )
+        .await
+        {
+            crate::cluster_shard::Dispatch::Done(response) => return response,
+            crate::cluster_shard::Dispatch::Local => Some(id),
+        }
+    } else {
+        None
     };
 
-    match idx.index_document(None, doc).await {
+    let idx = if preset_id.is_some() {
+        match state.engine.get_index(&index) {
+            Ok(i) => i,
+            Err(_) => return crate::cluster_shard::shard_not_ready_response(&index),
+        }
+    } else {
+        match state.engine.get_or_create_index(&index) {
+            Ok(i) => i,
+            Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+        }
+    };
+
+    match idx.index_document(preset_id, doc).await {
         Ok(resp) => {
             state.metrics.record_doc_indexed(&index);
             let er = EsDocResponse::created(
@@ -3981,11 +4070,6 @@ pub async fn index_doc(
         Err(resp) => return resp,
     };
 
-    let idx = match state.engine.get_or_create_index(&index) {
-        Ok(i) => i,
-        Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
-    };
-
     // op_type=create means fail if document already exists.
     let is_create_op = params.op_type.as_deref() == Some("create");
 
@@ -3994,6 +4078,37 @@ pub async fn index_doc(
     // (which runs on internal seqs), so a value read from GET/_search/_mget
     // or a previous write response round-trips correctly.
     let if_seq_no_internal = params.if_seq_no.map(|s| s.saturating_add(1));
+
+    if state.engine.has_cluster() {
+        match crate::cluster_shard::dispatch_index(
+            &state,
+            &index,
+            &id,
+            &doc,
+            if is_create_op { "create" } else { "index" },
+            if_seq_no_internal,
+            params.if_primary_term,
+            params.version,
+            params.version_type.clone(),
+        )
+        .await
+        {
+            crate::cluster_shard::Dispatch::Done(response) => return response,
+            crate::cluster_shard::Dispatch::Local => {}
+        }
+    }
+
+    let idx = if state.engine.has_cluster() {
+        match state.engine.get_index(&index) {
+            Ok(i) => i,
+            Err(_) => return crate::cluster_shard::shard_not_ready_response(&index),
+        }
+    } else {
+        match state.engine.get_or_create_index(&index) {
+            Ok(i) => i,
+            Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+        }
+    };
 
     if is_create_op {
         match idx.create_document(id.clone(), doc).await {
@@ -4114,9 +4229,27 @@ pub async fn create_doc(
         Err(resp) => return resp,
     };
 
-    let idx = match state.engine.get_or_create_index(&index) {
-        Ok(i) => i,
-        Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+    if state.engine.has_cluster() {
+        match crate::cluster_shard::dispatch_index(
+            &state, &index, &id, &doc, "create", None, None, None, None,
+        )
+        .await
+        {
+            crate::cluster_shard::Dispatch::Done(response) => return response,
+            crate::cluster_shard::Dispatch::Local => {}
+        }
+    }
+
+    let idx = if state.engine.has_cluster() {
+        match state.engine.get_index(&index) {
+            Ok(i) => i,
+            Err(_) => return crate::cluster_shard::shard_not_ready_response(&index),
+        }
+    } else {
+        match state.engine.get_or_create_index(&index) {
+            Ok(i) => i,
+            Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
+        }
     };
 
     match idx.create_document(id.clone(), doc).await {
@@ -4160,6 +4293,12 @@ pub async fn get_doc(
     // Strict membership only — frozen/open indices are unaffected.
     if state.engine.closed_indices.contains_key(&index) {
         return closed_index_error(&index);
+    }
+
+    if let crate::cluster_shard::Dispatch::Done(response) =
+        crate::cluster_shard::dispatch_get(&state, &index, &id, &params).await
+    {
+        return response;
     }
 
     let idx = match state.engine.get_index(&index) {
@@ -4212,7 +4351,7 @@ pub async fn get_doc(
 }
 
 /// Filter the _source of a GET _doc response based on query params.
-fn apply_get_doc_source_filter(source: Value, params: &GetDocParams) -> Value {
+pub(crate) fn apply_get_doc_source_filter(source: Value, params: &GetDocParams) -> Value {
     // _source=false → suppress everything.
     if params.source.as_deref() == Some("false") {
         return Value::Null;
@@ -4309,13 +4448,25 @@ pub async fn delete_doc(
     Path((index, id)): Path<(String, String)>,
     Query(params): Query<DeleteDocParams>,
 ) -> impl IntoResponse {
+    // Wire → internal seq translation, same convention as the index path.
+    let if_seq_no_internal = params.if_seq_no.map(|s| s.saturating_add(1));
+
+    if let crate::cluster_shard::Dispatch::Done(response) = crate::cluster_shard::dispatch_delete(
+        &state,
+        &index,
+        &id,
+        if_seq_no_internal,
+        params.if_primary_term,
+    )
+    .await
+    {
+        return response;
+    }
+
     let idx = match state.engine.get_index(&index) {
         Ok(i) => i,
         Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
     };
-
-    // Wire → internal seq translation, same convention as the index path.
-    let if_seq_no_internal = params.if_seq_no.map(|s| s.saturating_add(1));
 
     match idx
         .delete_document_versioned(&id, if_seq_no_internal, params.if_primary_term)
@@ -4356,7 +4507,7 @@ pub async fn delete_doc(
 // Supports comma-separated multi-index: /index1,index2/_search
 // ─────────────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct EsSearchBody {
     #[serde(default)]
     pub query: Option<Value>,
@@ -8898,7 +9049,7 @@ fn parse_highlight(hl_val: &Value) -> Option<xerj_query::ast::HighlightRequest> 
 ///
 /// These are common params used by simple ES clients and curl one-liners.
 /// Most are accepted and ignored (preference, routing, etc.) to avoid 400 errors.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct EsSearchQueryParams {
     /// Simple query string — `?q=title:rust`.
     pub q: Option<String>,
@@ -11907,7 +12058,7 @@ pub async fn search(
     // `memory_api`'s recall test, which calls this handler directly, overflows
     // its stack on the extra copy. Boxing keeps the wrapper pointer-sized.
     let (response, fault) = xerj_engine::painless::with_script_fault_capture(Box::pin(
-        search_impl(state, index, params, principal, body),
+        search_dispatch(state, index, params, principal, body),
     ))
     .await;
     match fault {
@@ -12415,6 +12566,32 @@ impl SkippedIndices {
             None
         }
     }
+}
+
+async fn search_dispatch(
+    state: AppState,
+    index: String,
+    params: EsSearchQueryParams,
+    principal: crate::auth::Principal,
+    body: EsSearchJson,
+) -> Response {
+    if let Some(response) =
+        crate::cluster_shard::fanout_search(&state, &index, &params, &principal, &body).await
+    {
+        return response;
+    }
+    search_impl(state, index, params, principal, body).await
+}
+
+/// One shard's search, used by the cluster fan-out. Does not fan out again.
+pub(crate) async fn search_shard_local(
+    state: AppState,
+    index: String,
+    params: EsSearchQueryParams,
+    principal: crate::auth::Principal,
+    body: EsSearchBody,
+) -> Response {
+    search_impl(state, index, params, principal, EsSearchJson(Some(body))).await
 }
 
 async fn search_impl(
@@ -19433,7 +19610,7 @@ pub struct ValidateQueryParams {
 }
 
 pub async fn validate_query(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Path(index): Path<String>,
     Query(params): Query<ValidateQueryParams>,
     body: OptionalJson<Value>,
@@ -19455,17 +19632,63 @@ pub async fn validate_query(
 
     match xerj_query::parse_request(&query_doc) {
         Ok(req) => {
+            // Parsing is only half the answer: `_search` also rewrites aliases,
+            // lowers keyword full-text to term, and rejects unsearchable fields
+            // and non-numeric values against numeric fields while it builds the
+            // query. Ask every resolved index the same question so this
+            // endpoint cannot report `valid: true` for a body `_search` refuses
+            // (the "GAP 5" this endpoint used to carry).
+            let targets = resolve_index_selector(&state, &index).await;
+            let mut successful = 0u64;
+            let mut first_error: Option<String> = None;
+            let mut explanations = Vec::new();
+            for name in &targets {
+                let outcome = match state.engine.get_index(name) {
+                    // A target the selector named but the engine does not hold
+                    // stays on the parse-only answer, as before.
+                    Ok(idx) => idx
+                        .validate_query(&req.query)
+                        .await
+                        .map_err(|e| e.to_string()),
+                    Err(_) => Ok(()),
+                };
+                match outcome {
+                    Ok(()) => {
+                        successful += 1;
+                        if explain {
+                            explanations.push(json!({
+                                "index": name,
+                                "valid": true,
+                                "explanation": format!("{:?}", req.query),
+                            }));
+                        }
+                    }
+                    Err(error) => {
+                        if first_error.is_none() {
+                            first_error = Some(error.clone());
+                        }
+                        if explain {
+                            explanations.push(json!({
+                                "index": name,
+                                "valid": false,
+                                "error": error,
+                            }));
+                        }
+                    }
+                }
+            }
+            let total = targets.len() as u64;
+            let failed = total.saturating_sub(successful);
             let mut resp = json!({
-                "_shards": { "total": 1, "successful": 1, "failed": 0 },
-                "valid": true,
+                "_shards": { "total": total, "successful": successful, "failed": failed },
+                "valid": failed == 0,
                 "_index": index,
             });
+            if let Some(error) = first_error {
+                resp["error"] = json!(error);
+            }
             if explain {
-                resp["explanations"] = json!([{
-                    "index": index,
-                    "valid": true,
-                    "explanation": format!("{:?}", req.query),
-                }]);
+                resp["explanations"] = json!(explanations);
             }
             Json(resp).into_response()
         }
@@ -22890,6 +23113,32 @@ pub async fn count_docs(
     Query(params): Query<CountParams>,
     body: OptionalJson<Value>,
 ) -> impl IntoResponse {
+    // #193-style parity: ES's `_count` body accepts `min_score` and filters the
+    // counted set by it. The handler rebuilds a `size: 0` search body from the
+    // query alone, so this field used to be dropped and `_count` answered the
+    // unfiltered total while `_search` with the same body answered 0. A
+    // non-numeric value is the same 400 parse_exception `_search` gives.
+    let min_score = match body.as_ref().and_then(|b| b.get("min_score")) {
+        None | Some(Value::Null) => None,
+        Some(value) => match value.as_f64() {
+            Some(ms) => Some(ms),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "error": {
+                            "type": "parse_exception",
+                            "reason": format!(
+                                "malformed JSON in request body: invalid value for [min_score]: {value}"
+                            ),
+                            "status": 400,
+                        }
+                    })),
+                )
+                    .into_response();
+            }
+        },
+    };
     // Multi-index / all selector: sum counts from every participating index.
     //
     // An ALIAS belongs in this branch too. It used not to, so a multi-index
@@ -22959,6 +23208,7 @@ pub async fn count_docs(
             }
         }
         let has_query = !alias_filters.is_empty()
+            || min_score.is_some()
             || body
                 .as_ref()
                 .and_then(|b| b.get("query"))
@@ -23012,13 +23262,19 @@ pub async fn count_docs(
                 let search_body = json!({ "query": query_val, "size": 0, "from": 0 });
                 // A body that does not parse is not per-index: it is the same
                 // 400 the single-index arm returns, for the same reason.
-                let req = match xerj_query::parse_request(&search_body) {
+                let mut req = match xerj_query::parse_request(&search_body) {
                     Ok(r) => r,
                     Err(e) => {
                         let ze = xerj_common::XerjError::invalid_query(e.to_string());
                         return ApiError::new(ze).into_response();
                     }
                 };
+                // `parse_request` leaves `min_score` at None (the `_search`
+                // handler fills it from `EsSearchBody`), so the count path has
+                // to set it explicitly or the threshold is silently dropped.
+                if let Some(ms) = min_score {
+                    req.min_score = Some(ms);
+                }
                 match idx.search(&req).await {
                     Ok(result) => {
                         // A script resource limit in the filter (terms_set's
@@ -23081,12 +23337,15 @@ pub async fn count_docs(
         Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
     };
 
-    // If no query or match_all, use the stored stats for speed.
-    let has_query = body
-        .as_ref()
-        .and_then(|b| b.get("query"))
-        .map(|q| !q.is_null())
-        .unwrap_or(false);
+    // If no query or match_all, use the stored stats for speed. A body that
+    // carries `min_score` still has to run the query: match_all scores 1.0, so
+    // a threshold above it counts zero.
+    let has_query = min_score.is_some()
+        || body
+            .as_ref()
+            .and_then(|b| b.get("query"))
+            .map(|q| !q.is_null())
+            .unwrap_or(false);
 
     let count = if has_query {
         // Run a search with size=0 to get the total.
@@ -23101,15 +23360,25 @@ pub async fn count_docs(
         resolve_terms_lookups(&mut query_val, &state).await;
         let search_body = json!({ "query": query_val, "size": 0, "from": 0 });
         match xerj_query::parse_request(&search_body) {
-            Ok(req) => match idx.search(&req).await {
-                Ok(result) => {
-                    if let Some(reason) = &result.script_failure {
-                        return script_limit_response(reason);
-                    }
-                    result.total.value
+            Ok(mut req) => {
+                // `parse_request` leaves `min_score` at None (the `_search`
+                // handler fills it from `EsSearchBody`), so the count path has
+                // to set it explicitly or the threshold is silently dropped.
+                if let Some(ms) = min_score {
+                    req.min_score = Some(ms);
                 }
-                Err(e) => return ApiError::new(xerj_common::XerjError::from(e)).into_response(),
-            },
+                match idx.search(&req).await {
+                    Ok(result) => {
+                        if let Some(reason) = &result.script_failure {
+                            return script_limit_response(reason);
+                        }
+                        result.total.value
+                    }
+                    Err(e) => {
+                        return ApiError::new(xerj_common::XerjError::from(e)).into_response()
+                    }
+                }
+            }
             Err(e) => {
                 let ze = xerj_common::XerjError::invalid_query(e.to_string());
                 return ApiError::new(ze).into_response();
@@ -32105,46 +32374,54 @@ pub async fn put_settings(
         return ApiError::new(e).into_response();
     }
 
-    for idx in &targets {
-        let mut existing = state
-            .engine
-            .index_settings
-            .get(idx)
-            .map(|v| v.clone())
-            .unwrap_or(json!({ "index": {} }));
-        let inner_slot = existing
-            .as_object_mut()
-            .and_then(|m| m.get_mut("index").and_then(Value::as_object_mut));
-        match (inner_slot, inner.as_object()) {
-            (Some(existing_inner), Some(new_inner)) => {
-                for (k, v) in new_inner {
-                    existing_inner.insert(k.clone(), v.clone());
+    if state.engine.has_cluster() {
+        for idx in &targets {
+            if let Err(e) = state.engine.replicate_index_settings(idx, &body).await {
+                return ApiError::new(xerj_common::XerjError::from(e)).into_response();
+            }
+        }
+    } else {
+        for idx in &targets {
+            let mut existing = state
+                .engine
+                .index_settings
+                .get(idx)
+                .map(|v| v.clone())
+                .unwrap_or(json!({ "index": {} }));
+            let inner_slot = existing
+                .as_object_mut()
+                .and_then(|m| m.get_mut("index").and_then(Value::as_object_mut));
+            match (inner_slot, inner.as_object()) {
+                (Some(existing_inner), Some(new_inner)) => {
+                    for (k, v) in new_inner {
+                        existing_inner.insert(k.clone(), v.clone());
+                    }
+                }
+                _ => {
+                    // Either no existing index block or body wasn't an object —
+                    // replace wholesale.
+                    existing = json!({ "index": inner });
+                    state.engine.index_settings.insert(idx.clone(), existing);
+                    continue;
                 }
             }
-            _ => {
-                // Either no existing index block or body wasn't an object —
-                // replace wholesale.
-                existing = json!({ "index": inner });
-                state.engine.index_settings.insert(idx.clone(), existing);
-                continue;
-            }
+            state.engine.index_settings.insert(idx.clone(), existing);
         }
-        state.engine.index_settings.insert(idx.clone(), existing);
-    }
 
-    // `index.blocks.*` is not a display-only setting: it gates writes and reads
-    // in the engine, whose `Index::settings` is a different store from the
-    // `engine.index_settings` map updated above. Forward the block keys so a
-    // settings PUT can both set *and clear* a block — previously it updated only
-    // the display copy, leaving every block permanent once set.
-    for name in &targets {
-        let Ok(idx) = state.engine.get_index(name) else {
-            continue;
-        };
-        if let Err(e) = idx.apply_block_settings(&body).await {
-            return ApiError::new(xerj_common::XerjError::from(e)).into_response();
+        // `index.blocks.*` is not a display-only setting: it gates writes and reads
+        // in the engine, whose `Index::settings` is a different store from the
+        // `engine.index_settings` map updated above. Forward the block keys so a
+        // settings PUT can both set *and clear* a block — previously it updated only
+        // the display copy, leaving every block permanent once set.
+        for name in &targets {
+            let Ok(idx) = state.engine.get_index(name) else {
+                continue;
+            };
+            if let Err(e) = idx.apply_block_settings(&body).await {
+                return ApiError::new(xerj_common::XerjError::from(e)).into_response();
+            }
+            sync_display_blocks(&state, name).await;
         }
-        sync_display_blocks(&state, name).await;
     }
 
     // `PUT {index}/_settings` is the other real ILM entry point — for
@@ -47275,7 +47552,7 @@ fn count_dense_vector_fields(node: &Value) -> u64 {
 /// targets an index that has been closed via `POST /:index/_close`.
 /// Mirrors Elasticsearch's body shape so wire-compat clients see the
 /// exact `type`/`reason`/`index` triplet plus the duplicated root_cause.
-fn closed_index_error(index: &str) -> axum::response::Response {
+pub(crate) fn closed_index_error(index: &str) -> axum::response::Response {
     (
         StatusCode::BAD_REQUEST,
         Json(json!({

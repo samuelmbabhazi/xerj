@@ -111,6 +111,7 @@ impl ClusterMetadata {
             return;
         }
 
+        let command = command.as_metadata();
         match command {
             ClusterCommand::CreateIndex { name, schema_json } => {
                 self.apply_create_index(name, schema_json);
@@ -140,6 +141,20 @@ impl ClusterMetadata {
             ClusterCommand::UpdateConfig { key, value } => {
                 self.apply_update_config(key, value);
             }
+            ClusterCommand::UpdateIndexSettings {
+                index,
+                settings_json,
+            } => {
+                // The engine applier merges this into the live index. The
+                // metadata store keeps the latest body so a reader of the
+                // replicated state can see what was last committed.
+                info!(index = %index, "Applying UpdateIndexSettings");
+                self.config
+                    .insert(format!("index_settings:{index}"), settings_json.clone());
+            }
+            ClusterCommand::ClientMetadata { .. } => {
+                warn!("nested ClientMetadata wrapper; not applied");
+            }
         }
 
         self.last_applied_index = log_index;
@@ -163,10 +178,16 @@ impl ClusterMetadata {
             IndexMetadata {
                 name: name.to_string(),
                 schema_json: schema_json.to_string(),
-                num_shards: 1, // default; set by shard assignment commands
+                num_shards: 1, // widened by the shard plan below, when one is present
                 created_at: now,
             },
         );
+        // The plan rides in the same log entry as the create, so the index
+        // and its owners become visible together. A schema with no plan
+        // (older entries, tests) leaves the table empty.
+        for assignment in crate::shard::shard_plan_from_schema_json(schema_json) {
+            self.apply_assign_shard(name, assignment.shard, &assignment.node_id);
+        }
     }
 
     fn apply_delete_index(&mut self, name: &str) {

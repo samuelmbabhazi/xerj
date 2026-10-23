@@ -912,6 +912,142 @@ mod collection_publication_fail_closed_tests {
         assert_eq!(result.total.value, 5_050, "exact under churn");
     }
 
+    /// #1761 — finalize-verify's catalog query shares `autoindex-catalog` with
+    /// every other corpus build. Explicit-id catalog bulks publish one
+    /// document at a time, each bracket covering WAL + memtable insert, and
+    /// the next bracket opens immediately. A capture that clones the other
+    /// run's buffered rows never fits in that gap, so the verify search waits
+    /// out its deadline (`timed_out`, empty hits) and the phase sits at 0/N.
+    ///
+    /// This holds a tight `index_document` loop of another run's rows across
+    /// the exact verify filter (`terms file_key` AND `term run_id`) and
+    /// requires the search to return this run's count inside a short timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn catalog_verify_search_completes_while_another_run_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+        let mut schema = Schema::empty();
+        schema
+            .add_field(FieldConfig::new("file_key", FieldType::Keyword))
+            .unwrap();
+        schema
+            .add_field(FieldConfig::new("run_id", FieldType::Keyword))
+            .unwrap();
+        engine.create_index("autoindex-catalog", schema).unwrap();
+        let idx = engine.get_index("autoindex-catalog").unwrap();
+
+        const THIS_RUN: usize = 24;
+        const OTHER_RUN: usize = 2_000;
+        let this_docs: Vec<(Option<String>, Value)> = (0..THIS_RUN)
+            .map(|i| {
+                (
+                    Some(format!("this-{i}")),
+                    json!({"file_key": format!("k{i}"), "run_id": "this-run"}),
+                )
+            })
+            .collect();
+        for r in idx.index_documents_batched(this_docs).await {
+            r.unwrap();
+        }
+        idx.flush().await.unwrap();
+        let other_docs: Vec<(Option<String>, Value)> = (0..OTHER_RUN)
+            .map(|i| {
+                (
+                    Some(format!("other-{i}")),
+                    json!({"file_key": format!("o{i}"), "run_id": "other-run"}),
+                )
+            })
+            .collect();
+        for r in idx.index_documents_batched(other_docs).await {
+            r.unwrap();
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let wrote = Arc::new(AtomicU64::new(0));
+        let writer_idx = Arc::clone(&idx);
+        let writer_stop = Arc::clone(&stop);
+        let writer_wrote = Arc::clone(&wrote);
+        let writer = tokio::spawn(async move {
+            let mut n: u64 = 0;
+            while !writer_stop.load(Ordering::Relaxed) {
+                writer_idx
+                    .index_document(
+                        Some(format!("other-{}", n % OTHER_RUN as u64)),
+                        json!({
+                            "file_key": format!("o{}", n % OTHER_RUN as u64),
+                            "run_id": "other-run"
+                        }),
+                    )
+                    .await
+                    .expect("concurrent catalog write");
+                writer_wrote.fetch_add(1, Ordering::Relaxed);
+                n += 1;
+            }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while wrote.load(Ordering::Relaxed) < 8 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the other run never published a document");
+
+        let keys: Vec<String> = (0..THIS_RUN).map(|i| format!("k{i}")).collect();
+        let request = xerj_query::parse_request(&json!({
+            "query": {"bool": {"filter": [
+                {"terms": {"file_key": keys}},
+                {"term": {"run_id": "this-run"}}
+            ]}},
+            "size": THIS_RUN,
+            "track_total_hits": true,
+            "_source": ["file_key"],
+            "timeout": "2s"
+        }))
+        .unwrap();
+        let started = std::time::Instant::now();
+        let result = idx.search(&request).await.expect("verify search");
+        let elapsed = started.elapsed();
+        let buffered = idx.memtable.doc_count();
+        stop.store(true, Ordering::Relaxed);
+        tokio::time::timeout(std::time::Duration::from_secs(30), writer)
+            .await
+            .expect("writer did not stop")
+            .unwrap();
+
+        assert!(
+            !result.timed_out,
+            "finalize-verify catalog search timed out under a concurrent writer \
+             in {elapsed:?}: total={} hits={}",
+            result.total.value,
+            result.hits.len()
+        );
+        assert_eq!(
+            result.total.value, THIS_RUN as u64,
+            "the run_id filter must not count the other run's rows"
+        );
+        assert_eq!(
+            result.hits.len(),
+            THIS_RUN,
+            "the page must carry every match"
+        );
+        assert!(
+            buffered > THIS_RUN,
+            "the other run's rows must still be memtable-resident (buffered {buffered}); \
+             a flush would hide the publication stall this test exists for"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "the search must finish inside its timeout, took {elapsed:?}"
+        );
+        assert!(
+            result.hits.iter().all(|hit| hit.id.starts_with("this-")),
+            "a hit from the other run leaked into the page: {:?}",
+            result.hits.iter().map(|hit| &hit.id).collect::<Vec<_>>()
+        );
+    }
+
     #[tokio::test]
     async fn cache_and_singleflight_namespace_include_publication_generation() {
         let dir = tempfile::tempdir().unwrap();
@@ -10868,12 +11004,16 @@ impl Index {
         #[cfg(test)]
         if let Err(e) = self.wal_admission_test_fault(&doc_id) {
             collection_publication.cancel();
+            drop(collection_publication);
+            self.collection_publication.handoff_to_readers().await;
             return Err(e.into());
         }
         let seq_no = match self.store.index(&doc_id, source.clone()) {
             Ok(seq_no) => seq_no,
             Err(e) => {
                 collection_publication.cancel();
+                drop(collection_publication);
+                self.collection_publication.handoff_to_readers().await;
                 return Err(e.into());
             }
         };
@@ -10916,6 +11056,9 @@ impl Index {
             .unwrap_or(1);
         collection_publication.commit();
         drop(collection_publication);
+        // The next document's bracket must not open until a search parked on
+        // this one has validated its capture (#1761). No shard lock is held.
+        self.collection_publication.handoff_to_readers().await;
         // Auto-evolve schema for new fields.
         // Fast path: skip the schema read lock every doc when schema is stable.
         // We cache a hash of the document field keys and only re-check schema
@@ -11273,6 +11416,7 @@ impl Index {
         drop(copy_schema);
         collection_publication.commit();
         drop(collection_publication);
+        self.collection_publication.handoff_to_readers().await;
         let t4_dur = t4.elapsed();
 
         if batch_len >= 1000 {
@@ -11712,6 +11856,7 @@ impl Index {
             .collect();
         collection_publication.commit();
         drop(collection_publication);
+        self.collection_publication.handoff_to_readers().await;
         // The raw path already parsed every source for schema evolution and
         // FTS analysis. Publish those same authoritative values to HNSW before
         // the batch becomes observable to its caller.
@@ -12039,6 +12184,7 @@ impl Index {
             .fetch_add(batch_len as u64, Ordering::Relaxed);
         collection_publication.commit();
         drop(collection_publication);
+        self.collection_publication.handoff_to_readers_blocking();
 
         if !vector_sources.is_empty() {
             // This API runs on the CLI's Rayon workers. Cross into the cached
@@ -12290,6 +12436,7 @@ impl Index {
         }
         collection_publication.commit();
         drop(collection_publication);
+        self.collection_publication.handoff_to_readers().await;
         // Step 5: schema evolution + vector indexing (post-lock).
         for ingest in &processed {
             self.evolve_schema_from_doc(&ingest.source).await;
@@ -14018,6 +14165,7 @@ impl Index {
                         }
                     }
                     drop(collection_publication);
+                    self.collection_publication.handoff_to_readers().await;
                     if let Err(e) = apply_result {
                         tracing::warn!("merge: apply_merge failed: {e:?}");
                         failed_batches.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -16475,6 +16623,7 @@ impl Index {
             if generation != capture_generation || in_flight != 0 {
                 return Err(collection_capture_crossed());
             }
+            self.collection_publication.note_capture_validated();
         }
         // #1220 regression hook: park the scan the instant its capture
         // validates, so a test can publish a write, merge or flush into the
@@ -18409,6 +18558,7 @@ impl Index {
             if generation != capture_generation || in_flight != 0 {
                 return Err(collection_capture_crossed());
             }
+            self.collection_publication.note_capture_validated();
         }
         let captured_segment_ids: std::collections::HashSet<&str> =
             snap.segments.iter().map(|meta| meta.id.as_str()).collect();
@@ -19424,6 +19574,8 @@ impl Index {
             Ok(deleted_seq) => deleted_seq,
             Err(e) => {
                 collection_publication.cancel();
+                drop(collection_publication);
+                self.collection_publication.handoff_to_readers().await;
                 return Err(e.into());
             }
         };
@@ -19454,6 +19606,7 @@ impl Index {
             let seq_no = self.store.current_seq_no().saturating_sub(1);
             collection_publication.commit();
             drop(collection_publication);
+            self.collection_publication.handoff_to_readers().await;
             #[cfg(test)]
             self.publication_test_point(id, PublicationTestPoint::BeforeRelease);
             return Ok(DeleteDocOutcome {
@@ -19471,6 +19624,7 @@ impl Index {
         let seq_no = deleted_seq.unwrap_or_else(|| self.store.current_seq_no().saturating_sub(1));
         collection_publication.commit();
         drop(collection_publication);
+        self.collection_publication.handoff_to_readers().await;
         // v0.6.2 — propagate the delete into the HNSW graph. Pre-fix
         // a deleted doc was unfindable via _get / _search but the
         // vector still showed up in kNN results forever (the node
@@ -20237,6 +20391,29 @@ impl Index {
     }
 
     /// Execute a search request against this index.
+    /// #1504. Autoindex writes `index.query.default_match_operator: and` on a
+    /// logs dataset so an omitted `match` requires every token. The key is
+    /// stored the way the create body sent it (a flat dotted key, or nested
+    /// under `index.query`). Any other value, including absence, keeps ES's
+    /// OR default.
+    fn match_operator_defaults_to_and(settings: &Value) -> bool {
+        let is_and = |v: &Value| v.as_str().is_some_and(|s| s.eq_ignore_ascii_case("and"));
+        if settings
+            .pointer("/index/query/default_match_operator")
+            .is_some_and(is_and)
+        {
+            return true;
+        }
+        [Some(settings), settings.get("index")]
+            .into_iter()
+            .flatten()
+            .any(|container| {
+                container
+                    .get("index.query.default_match_operator")
+                    .is_some_and(is_and)
+            })
+    }
+
     pub async fn search(&self, request: &SearchRequest) -> Result<SearchResult> {
         use crate::collection_publication::ReadAdmission;
 
@@ -20263,6 +20440,12 @@ impl Index {
                     // admission never captured a view — `total.relation`
                     // is `gte`, so the page is a bound, not an empty corpus.
                     ReadAdmission::WriterActive => {
+                        // Park visibly so the writer, after it drops this
+                        // bracket, can keep the next one closed until we
+                        // capture (#1761). The guard disarms on timeout and
+                        // on the wake.
+                        self.collection_publication.arm_reader();
+                        let _waiting = ReaderWaitGuard(&self.collection_publication);
                         if tokio::time::timeout_at(
                             tokio::time::Instant::from_std(deadline),
                             notified,
@@ -20275,6 +20458,12 @@ impl Index {
                     }
                 }
             };
+            // Hold a capture reservation until this attempt returns. The
+            // snapshot check inside `search_inner` publishes
+            // `note_capture_validated` as soon as the pair is stable, which
+            // is what lets the writer open its next bracket while the scan
+            // of that snapshot is still running.
+            let _capture = ReaderCapture::begin(&self.collection_publication);
             let result = self
                 .search_at_generation(request, token.generation(), deadline)
                 .await;
@@ -20334,6 +20523,22 @@ impl Index {
                 savings: None,
             }
         };
+        // #1504: a logs index resolves an omitted match operator to AND
+        // before the cache key is hashed, so a cached page cannot be the OR
+        // hit list. Indices without the setting keep the request as parsed
+        // (Omitted executes as OR). Explicit `"operator": "or"` is untouched.
+        let default_match_and = {
+            let settings = self.settings.read().await;
+            Self::match_operator_defaults_to_and(&settings)
+        };
+        let rewritten = if default_match_and {
+            let mut owned = request.clone();
+            xerj_query::apply_default_match_operator(&mut owned, xerj_query::BoolOperator::And);
+            Some(owned)
+        } else {
+            None
+        };
+        let request = rewritten.as_ref().unwrap_or(request);
         // M3 framework: response cache.  Hash the request shape and the
         // current dataset version; on a hit return the cloned `Arc<SearchResult>`
         // immediately, skipping the semaphore, search_inner, locks, and
@@ -20763,6 +20968,19 @@ impl Index {
         }
     }
 
+    /// Validate a query exactly as [`Index::search`] will build it, without
+    /// executing it. One definition of "buildable": the alias and
+    /// keyword-full-text rewrites, then the unsearchable-field (#204) and
+    /// non-numeric-value (#1284) checks. `_validate/query` uses this so its
+    /// `valid` flag cannot disagree with `_search` on the same body.
+    pub async fn validate_query(
+        &self,
+        query: &QueryNode,
+    ) -> std::result::Result<(), xerj_common::XerjError> {
+        let schema = self.schema.read().await;
+        check_buildable_query(query, &schema.schema).map(|_| ())
+    }
+
     /// Inner search implementation (without timeout wrapper).
     async fn search_inner(
         &self,
@@ -20887,26 +21105,11 @@ impl Index {
         // from `_source` (#204 — accepted means honoured).
         let resolved_query = {
             let schema = self.schema.read().await;
-            let resolved = rewrite_keyword_full_text_to_term(
-                &rewrite_query_aliases(&request.query, &schema.schema),
-                &schema.schema,
-            );
-            if let Some(field) = unsearchable_query_field(&resolved, &schema.schema) {
-                return Err(EngineError::Common(xerj_common::XerjError::invalid_query(
-                    format!(
-                        "failed to create query: Cannot search on field [{field}] \
-                         since it is not indexed nor has doc values."
-                    ),
-                )));
-            }
-            // #1284: a non-numeric value against a numeric field is a query
-            // that cannot be built, and ES fails it (`query_shard_exception` /
-            // `number_format_exception`) rather than answering a 0-hit.
-            if let Some(value) = non_numeric_term_value(&resolved, &schema.schema) {
-                return Err(EngineError::Common(xerj_common::XerjError::invalid_query(
-                    format!("failed to create query: For input string: \"{value}\""),
-                )));
-            }
+            // One definition of "buildable" (alias/keyword rewrites + the
+            // unsearchable-field and #1284 numeric checks), shared with
+            // `_validate/query`; see `check_buildable_query`.
+            let resolved = check_buildable_query(&request.query, &schema.schema)
+                .map_err(EngineError::Common)?;
             // #437: a sort field this engine cannot resolve (any of 11 ES
             // meta-field names besides the ones handled below, or an
             // unmapped/misspelled field) fell through to `_source` lookup
@@ -22425,6 +22628,7 @@ impl Index {
             if generation != capture_generation || in_flight != 0 {
                 return Err(collection_capture_crossed());
             }
+            self.collection_publication.note_capture_validated();
         }
         // #1212 — the captured world's segment ids, scoping every LIVE
         // version-map read the walk performs below. The scan's segments are
@@ -31563,7 +31767,13 @@ impl Index {
                 Some(Arc::new(PrefilterSet::from_set(set)))
             }
             Column::Keyword(k) => {
-                let mut set: HashSet<u32> = HashSet::new();
+                // One pass over `ords` for every value in the window. The
+                // previous loop scanned the whole ordinal column once per
+                // terms value, so a 1,024-value finalize-verify window walked
+                // a large shared catalog 1,024 times (the seg-loop in #1761).
+                // Duplicate values share an ordinal and are counted once.
+                let mut wanted: HashSet<u32> = HashSet::new();
+                let mut card: usize = 0;
                 for v in values {
                     let term = match v {
                         Value::String(s) => {
@@ -31584,12 +31794,19 @@ impl Index {
                     let Some(ord) = k.ord_for_term(&term) else {
                         continue; // term absent in this segment → contributes 0
                     };
-                    let card = k.per_ord_count.get(ord as usize).copied().unwrap_or(0) as usize;
-                    if set.len() + card > TERM_PREFILTER_CAP {
+                    if !wanted.insert(ord) {
+                        continue;
+                    }
+                    let n = k.per_ord_count.get(ord as usize).copied().unwrap_or(0) as usize;
+                    if card + n > TERM_PREFILTER_CAP {
                         return None;
                     }
+                    card += n;
+                }
+                let mut set: HashSet<u32> = HashSet::with_capacity(card);
+                if !wanted.is_empty() {
                     for (pos, &o) in k.ords.iter().enumerate() {
-                        if o == ord && !k.null_bitmap.contains(pos as u32) {
+                        if wanted.contains(&o) && !k.null_bitmap.contains(pos as u32) {
                             set.insert(pos as u32);
                         }
                     }
@@ -33604,6 +33821,37 @@ tokio::task_local! {
 // This deliberately remains a free function so background tasks can own every
 // flush dependency without retaining `Index`; grouping the values would only
 // hide the same pipeline dependency set behind an uninformative bag of fields.
+/// Disarms a reader wait on drop, including the deadline-timeout return.
+struct ReaderWaitGuard<'a>(&'a crate::collection_publication::CollectionPublication);
+
+impl Drop for ReaderWaitGuard<'_> {
+    fn drop(&mut self) {
+        self.0.disarm_reader();
+    }
+}
+
+/// Reserves a capture slot for one `search()` attempt. Dropped when that
+/// attempt returns. `note_capture_validated` is what releases a waiting
+/// writer, and it fires at the capture check, not here.
+struct ReaderCapture {
+    publication: Arc<crate::collection_publication::CollectionPublication>,
+}
+
+impl ReaderCapture {
+    fn begin(publication: &Arc<crate::collection_publication::CollectionPublication>) -> Self {
+        publication.begin_capture();
+        Self {
+            publication: Arc::clone(publication),
+        }
+    }
+}
+
+impl Drop for ReaderCapture {
+    fn drop(&mut self) {
+        self.publication.end_capture();
+    }
+}
+
 fn collection_publication_interrupted() -> EngineError {
     EngineError::Fts(anyhow::anyhow!(
         "collection publication was interrupted; reopen the index so WAL recovery can rebuild a consistent searchable state"
@@ -43024,6 +43272,37 @@ fn has_analyzed_text_term_leaf(q: &QueryNode, schema: &Schema) -> bool {
 
 /// The first field in `q` that the mapping has made completely unsearchable.
 ///
+/// The schema checks that make a query unbuildable, shared by `search` and
+/// `_validate/query`. Applies the same two rewrites execution does (field
+/// aliases, then keyword full-text → term) before checking:
+///
+/// - a field declared `"index": false` with no doc values has neither postings
+///   nor a column to scan, so ES rejects the query (#204);
+/// - a non-numeric value against a numeric field cannot be built (#1284).
+///
+/// Returns the rewritten tree `search` should execute, or the same error
+/// `_search` would return. `_validate/query` calls this through
+/// [`Index::validate_query`]; before that it answered from the parse alone and
+/// reported `valid: true` for a body `_search` refused.
+fn check_buildable_query(
+    query: &QueryNode,
+    schema: &Schema,
+) -> std::result::Result<QueryNode, xerj_common::XerjError> {
+    let resolved = rewrite_keyword_full_text_to_term(&rewrite_query_aliases(query, schema), schema);
+    if let Some(field) = unsearchable_query_field(&resolved, schema) {
+        return Err(xerj_common::XerjError::invalid_query(format!(
+            "failed to create query: Cannot search on field [{field}] \
+             since it is not indexed nor has doc values."
+        )));
+    }
+    if let Some(value) = non_numeric_term_value(&resolved, schema) {
+        return Err(xerj_common::XerjError::invalid_query(format!(
+            "failed to create query: For input string: \"{value}\""
+        )));
+    }
+    Ok(resolved)
+}
+
 /// A field is unsearchable when its mapping declares BOTH `"index": false`
 /// (no postings) and no doc values (nothing to scan instead) — for example
 /// `{"type": "text", "index": false}`, since `text` has no doc values by
@@ -43099,12 +43378,9 @@ fn has_analyzed_text_term_leaf(q: &QueryNode, schema: &Schema) -> bool {
 /// which it raises whether or not `index: false` was declared — a wider
 /// divergence than this change, and one this error message would misreport.
 ///
-/// And one surface never reaches this function at all: `_validate/query`
-/// (`xerj-api/src/es_compat.rs::validate_query`) answers from the parse alone
-/// and never opens the index, so it still reports `{"valid": true}` for a body
-/// `_search` refuses. That is its behaviour on `main` too — this change did
-/// not alter it — but it now disagrees with `_search`, so it is written down
-/// here and in the CHANGELOG instead of being left to surprise someone.
+/// `_validate/query` reaches this check through [`check_buildable_query`]
+/// (via `Index::validate_query`), so its `valid` flag is the same answer
+/// `_search` gives for the same body.
 fn unsearchable_query_field(q: &QueryNode, schema: &Schema) -> Option<String> {
     let check = |field: &str| -> Option<String> {
         let fc = declared_field(schema, field)?;
@@ -46181,7 +46457,7 @@ fn mem_bool_preds(q: &QueryNode) -> Option<Vec<crate::memtable::MemBoolPred>> {
     // `doc_values_range_query` paths would pay (~all-matching doc_id
     // String clones per query at a 200 k-doc memtable).
     let children: Vec<&QueryNode> = match q {
-        QueryNode::Term { .. } | QueryNode::Range { .. } => vec![q],
+        QueryNode::Term { .. } | QueryNode::Range { .. } | QueryNode::Terms { .. } => vec![q],
         QueryNode::Bool {
             must,
             should,
@@ -46223,6 +46499,31 @@ fn mem_bool_preds(q: &QueryNode) -> Option<Vec<crate::memtable::MemBoolPred>> {
                 preds.push(MemBoolPred::Term {
                     field: field.clone(),
                     value: val_str,
+                });
+            }
+            QueryNode::Terms { field, values, .. } => {
+                // Same lowering (and CIDR bailout) as the Term arm. An empty
+                // list is a real predicate that matches nothing; returning
+                // None would send the caller through `DocsForScan` and clone
+                // every buffered document (#1761).
+                let mut lowered: Vec<String> = Vec::with_capacity(values.len());
+                for value in values {
+                    let val_str = match value {
+                        Value::String(s) => {
+                            if s.contains('/') {
+                                return None;
+                            }
+                            s.clone()
+                        }
+                        Value::Number(n) => n.to_string(),
+                        Value::Bool(b) => b.to_string(),
+                        _ => return None,
+                    };
+                    lowered.push(val_str);
+                }
+                preds.push(MemBoolPred::Terms {
+                    field: field.clone(),
+                    values: lowered,
                 });
             }
             QueryNode::Range {
@@ -47622,15 +47923,18 @@ pub(crate) fn doc_matches_query_typed(q: &QueryNode, source: &Value, schema: &Sc
                 }
                 let need = match operator {
                     xerj_query::ast::BoolOperator::And => q_tokens.len(),
-                    xerj_query::ast::BoolOperator::Or => match minimum_should_match {
-                        None => 1,
-                        Some(MinShouldMatch::Fixed(n)) => *n as usize,
-                        Some(MinShouldMatch::Percentage(pct)) => {
-                            ((q_tokens.len() as f32 * (*pct as f32 / 100.0)).floor() as usize)
-                                .max(1)
+                    // Omitted is OR until a log index rewrites it (#1504).
+                    xerj_query::ast::BoolOperator::Or | xerj_query::ast::BoolOperator::Omitted => {
+                        match minimum_should_match {
+                            None => 1,
+                            Some(MinShouldMatch::Fixed(n)) => *n as usize,
+                            Some(MinShouldMatch::Percentage(pct)) => {
+                                ((q_tokens.len() as f32 * (*pct as f32 / 100.0)).floor() as usize)
+                                    .max(1)
+                            }
+                            Some(other) => other.required(q_tokens.len()).unwrap_or(1),
                         }
-                        Some(other) => other.required(q_tokens.len()).unwrap_or(1),
-                    },
+                    }
                 };
                 let raw_values: Vec<String> = match get_field_value(source, field) {
                     Some(Value::String(value)) => vec![value],
@@ -47744,17 +48048,21 @@ pub(crate) fn doc_matches_query_typed(q: &QueryNode, source: &Value, schema: &Sc
             // so the threshold applies across the union.
             let need: usize = match operator {
                 xerj_query::ast::BoolOperator::And => q_tokens.len(),
-                xerj_query::ast::BoolOperator::Or => match minimum_should_match {
-                    None => 1,
-                    Some(MinShouldMatch::Fixed(n)) => *n as usize,
-                    Some(MinShouldMatch::Percentage(pct)) => {
-                        ((q_tokens.len() as f32 * (*pct as f32 / 100.0)).floor() as usize).max(1)
+                // Omitted is OR until a log index rewrites it (#1504).
+                xerj_query::ast::BoolOperator::Or | xerj_query::ast::BoolOperator::Omitted => {
+                    match minimum_should_match {
+                        None => 1,
+                        Some(MinShouldMatch::Fixed(n)) => *n as usize,
+                        Some(MinShouldMatch::Percentage(pct)) => {
+                            ((q_tokens.len() as f32 * (*pct as f32 / 100.0)).floor() as usize)
+                                .max(1)
+                        }
+                        // #846: negative / negative-% / combination resolve against
+                        // the token count; terms_set field/script counts aren't
+                        // valid on a plain match, so degrade those to OR (need 1).
+                        Some(other) => other.required(q_tokens.len()).unwrap_or(1),
                     }
-                    // #846: negative / negative-% / combination resolve against
-                    // the token count; terms_set field/script counts aren't
-                    // valid on a plain match, so degrade those to OR (need 1).
-                    Some(other) => other.required(q_tokens.len()).unwrap_or(1),
-                },
+                }
             };
             let count_matched = |field_tokens: &[String]| -> usize {
                 q_tokens
@@ -62018,6 +62326,137 @@ mod exact_scan_hydration_tests {
         assert!(
             drained.load(std::sync::atomic::Ordering::SeqCst),
             "on_drained must fire on the empty-shard fast path"
+        );
+    }
+}
+
+/// #1504: a logs index's omitted `match` requires every token. The same
+/// query on an index without the setting stays ES's OR, and an explicit
+/// `"operator": "or"` on the logs index stays OR too.
+#[cfg(test)]
+mod log_match_operator_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn message_schema() -> Schema {
+        let mut schema = Schema::empty();
+        schema
+            .add_field(FieldConfig::new("message", FieldType::Text))
+            .unwrap();
+        schema
+    }
+
+    fn english() -> Value {
+        json!({"analysis": {"analyzer": {"default": {"type": "english"}}}})
+    }
+
+    async fn index_lines(idx: &Index, lines: &[(&str, &str)]) {
+        idx.abort_background_tasks();
+        for (id, message) in lines {
+            idx.index_document(Some((*id).to_string()), json!({"message": message}))
+                .await
+                .unwrap();
+        }
+    }
+
+    fn hit_ids(result: &SearchResult) -> Vec<String> {
+        let mut ids: Vec<String> = result.hits.iter().map(|hit| hit.id.clone()).collect();
+        ids.sort();
+        ids
+    }
+
+    const LINES: &[(&str, &str)] = &[
+        ("sip-only", "SIP engine not registered"),
+        ("forbidden", "SIP/2.0 403 Forbidden"),
+        ("is-only", "device is online"),
+        ("both-words", "invalid configuration detected"),
+    ];
+
+    #[test]
+    fn the_setting_is_read_from_a_flat_key_or_a_nested_object() {
+        assert!(Index::match_operator_defaults_to_and(&json!({
+            "index.query.default_match_operator": "and"
+        })));
+        assert!(Index::match_operator_defaults_to_and(&json!({
+            "index": {"query": {"default_match_operator": "AND"}}
+        })));
+        assert!(!Index::match_operator_defaults_to_and(&json!({
+            "analysis": {"analyzer": {"default": {"type": "english"}}}
+        })));
+        assert!(!Index::match_operator_defaults_to_and(&json!({
+            "index.query.default_match_operator": "or"
+        })));
+    }
+
+    #[tokio::test]
+    async fn a_log_index_match_requires_every_token_and_a_plain_index_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.server.data_dir = dir.path().to_string_lossy().into_owned();
+        let engine = crate::Engine::new(config).unwrap();
+
+        let mut logs_settings = english();
+        logs_settings["index.query.default_match_operator"] = json!("and");
+        engine
+            .create_index_with_settings("logs", message_schema(), logs_settings)
+            .unwrap();
+        engine
+            .create_index_with_settings("plain", message_schema(), english())
+            .unwrap();
+        let logs = engine.get_index("logs").unwrap();
+        let plain = engine.get_index("plain").unwrap();
+        index_lines(&logs, LINES).await;
+        index_lines(&plain, LINES).await;
+
+        let sip = xerj_query::parse_request(&json!({
+            "query": {"match": {"message": "SIP 403 Forbidden"}},
+            "size": 10
+        }))
+        .unwrap();
+        let sip_or = xerj_query::parse_request(&json!({
+            "query": {"match": {"message": {"query": "SIP 403 Forbidden", "operator": "or"}}},
+            "size": 10
+        }))
+        .unwrap();
+
+        // Memtable path (operator AND is a stored scan) and the flushed FTS
+        // path must agree: a line that only says SIP is not the phrase.
+        for idx in [&logs, &plain] {
+            let before = hit_ids(&idx.search(&sip).await.unwrap());
+            idx.flush().await.unwrap();
+            let after = hit_ids(&idx.search(&sip).await.unwrap());
+            assert_eq!(before, after, "flush must not change the hit set");
+        }
+        assert_eq!(
+            hit_ids(&logs.search(&sip).await.unwrap()),
+            vec!["forbidden".to_string()],
+            "SIP 403 Forbidden must not hit a line that only contains SIP"
+        );
+        assert_eq!(
+            hit_ids(&logs.search(&sip_or).await.unwrap()),
+            vec!["forbidden".to_string(), "sip-only".to_string()],
+            "an explicit operator or still matches any token"
+        );
+        let plain_hits = hit_ids(&plain.search(&sip).await.unwrap());
+        assert!(
+            plain_hits.contains(&"sip-only".to_string())
+                && plain_hits.contains(&"forbidden".to_string()),
+            "without the setting, match stays OR: {plain_hits:?}"
+        );
+
+        let phrase = xerj_query::parse_request(&json!({
+            "query": {"match": {"message": "configuration is invalid"}},
+            "size": 10
+        }))
+        .unwrap();
+        assert_eq!(
+            hit_ids(&logs.search(&phrase).await.unwrap()),
+            vec!["both-words".to_string()],
+            "is is not a term, and the other two words must both be present"
+        );
+        assert!(
+            !hit_ids(&plain.search(&phrase).await.unwrap()).contains(&"is-only".to_string()),
+            "the english analyzer already drops is, on a non-log index too"
         );
     }
 }

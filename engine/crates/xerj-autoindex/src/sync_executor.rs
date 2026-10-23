@@ -953,7 +953,8 @@ impl<'a> EsSyncBackend<'a> {
     /// `credit` ticks the current phase once per window after that window's
     /// answer is in. The capability probe passes `false`: it is one sample,
     /// not one of the phase's windows, and a tick there would walk the bar
-    /// past its denominator.
+    /// past its denominator. A `timed_out` page bails before the tick, so a
+    /// partial window is not counted as zero and is not credited (#1761).
     fn windowed_value_counts(
         &self,
         index: &str,
@@ -982,6 +983,18 @@ impl<'a> EsSyncBackend<'a> {
                     "aggs": {"values": {"terms": {"field": field, "size": window.len()}}}
                 }),
             )?;
+            // A deadline page is HTTP 200 with `timed_out` and an empty
+            // aggregation. Counting it as "every digest is absent" aborts a
+            // generation whose rows are on the node (#1761's concurrent
+            // catalog writer hits this deadline). Say so; rerunning resumes.
+            if response.get("timed_out") == Some(&Value::Bool(true)) {
+                anyhow::bail!(
+                    "finalize-verify search on {index} returned timed_out: the page is partial \
+                     and is not a live count (a concurrent writer on this index can hold \
+                     publication across the deadline). Nothing from this window was counted — \
+                     rerun the same command, which resumes"
+                );
+            }
             for bucket in response
                 .pointer("/aggregations/values/buckets")
                 .and_then(Value::as_array)
@@ -1052,6 +1065,16 @@ impl<'a> EsSyncBackend<'a> {
                         ]}}
                     }),
                 )?;
+                if response.get("timed_out") == Some(&Value::Bool(true)) {
+                    anyhow::bail!(
+                        "finalize-verify search on {} returned timed_out: the page is partial \
+                         and is not a live catalog count (a concurrent corpus build publishing \
+                         to this shared index can hold the publication bracket across the \
+                         deadline). Nothing from this window was counted — rerun the same \
+                         command, which resumes",
+                        crate::catalog::CATALOG_INDEX
+                    );
+                }
                 let page_total = response
                     .pointer("/hits/total/value")
                     .and_then(Value::as_u64)
@@ -1090,6 +1113,9 @@ impl<'a> EsSyncBackend<'a> {
             );
             // One tick per window, after the window's pages have all come
             // back. The phase denominator is windows, not pages (#1267).
+            // A `timed_out` page bails above, so a partial catalog window is
+            // not counted as zero and the phase does not sit at 0/N while
+            // another corpus publishes to this shared index (#1761).
             credit_verify_items(self.pr, 1);
         }
         Ok(counts)
@@ -2653,28 +2679,35 @@ fn check_bulk_outcome(
     outcome: crate::esclient::BulkOutcome,
 ) -> Result<()> {
     // `Es::bulk` has already re-sent per-item 429s, and only those, for the
-    // whole of its patience (`THROTTLE_PATIENCE`, #944/#949).
-    // What is left is either a server condition that did not clear — fatal,
-    // and resumable, because a sealed operation is journaled applied only
-    // after this returns — or a record the server refused outright.
+    // whole of its patience (`THROTTLE_PATIENCE`, #944/#949, shortened to
+    // `ZERO_PROGRESS_PATIENCE` when a parent memory breaker accepts nothing,
+    // #2238). What is left is either a server condition that did not clear —
+    // fatal, and resumable, because a sealed operation is journaled applied
+    // only after this returns — or a record the server refused outright.
     if outcome.throttled_out > 0 {
-        return Err(anyhow::Error::new(crate::esclient::BackpressureExhausted {
-            items: outcome.server_errors,
-            patience: es.throttle_patience(),
-            reason: outcome
-                .first_server_error
-                .unwrap_or_else(|| "unknown server error".into()),
-        }));
+        let patience = outcome
+            .exhausted_after
+            .unwrap_or_else(|| es.throttle_patience());
+        let reason = outcome
+            .first_server_error
+            .unwrap_or_else(|| "unknown server error".into());
+        return Err(anyhow::Error::new(crate::esclient::backpressure_exhausted(
+            outcome.server_errors,
+            patience,
+            &reason,
+        )));
     }
     if outcome.server_errors > 0 {
+        let reason = outcome
+            .first_server_error
+            .as_deref()
+            .map(crate::esclient::memory_cap_hint)
+            .unwrap_or_else(|| "unknown server error".into());
         anyhow::bail!(
-            "the server failed {} of a prepared bulk's items: {}. Nothing from this bulk was \
+            "the server failed {} of a prepared bulk's items: {reason}. Nothing from this bulk was \
              journaled applied; fix the reported server condition and rerun the same command — \
              the run resumes from its last committed operation",
             outcome.server_errors,
-            outcome
-                .first_server_error
-                .unwrap_or_else(|| "unknown server error".into())
         );
     }
     anyhow::ensure!(

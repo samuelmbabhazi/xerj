@@ -544,6 +544,17 @@ fn dataset_mapping_body(dataset: &PlanDataset, extra: &[infer::FieldSpec]) -> Va
     } else {
         create_body["settings"] = json!({"index.query.strict_unknown_fields": true});
     }
+    // #1504: log messages are searched as phrases. The english analyzer
+    // already drops `is`; an omitted `match` is still OR for the content
+    // words, so `SIP 403 Forbidden` hits every line that contains `SIP`.
+    // The engine reads this key in `Index::search` and fills an omitted
+    // operator with AND. An explicit `"operator": "or"` is left alone, and
+    // a non-log index never gets the key, so the ES default stays OR.
+    // The key lives here, beside `strict_unknown_fields`, and not in
+    // `build_mapping`: that value is hashed into the generation contract.
+    if dataset.family == "logs" {
+        create_body["settings"]["index.query.default_match_operator"] = json!("and");
+    }
     create_body
 }
 
@@ -2528,6 +2539,16 @@ fn replacement_failpoint(_boundary: u8, _state_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The first server error, with `limits.max_process_memory_mb` named when
+/// the rejection is the parent memory breaker (#2238).
+fn server_error_text(outcome: &crate::esclient::BulkOutcome) -> String {
+    outcome
+        .first_server_error
+        .as_deref()
+        .map(crate::esclient::memory_cap_hint)
+        .unwrap_or_else(|| "unknown server error".into())
+}
+
 /// Send one bulk body and fold its per-item rejections into
 /// `rejected_records`.
 ///
@@ -2559,10 +2580,7 @@ fn record_bulk_outcome(
                      complete; fix the server condition (or wait for it to clear) and rerun \
                      autoindex — the run resumes from the journal",
                     outcome.server_errors,
-                    outcome
-                        .first_server_error
-                        .as_deref()
-                        .unwrap_or("unknown server error")
+                    server_error_text(&outcome)
                 ));
                 return true;
             }
@@ -2872,10 +2890,7 @@ where
                          complete; fix the server condition (or wait for it to clear) and rerun \
                          autoindex — the run resumes from the journal",
                         outcome.server_errors,
-                        outcome
-                            .first_server_error
-                            .as_deref()
-                            .unwrap_or("unknown server error")
+                        server_error_text(&outcome)
                     );
                     for t in &tokens {
                         st.failed.insert(*t);
@@ -3884,6 +3899,135 @@ mod phase_a_grouping_tests {
         );
     }
 
+    /// #1504: desk-phone syslog (`<PRI>Mon dd hh:mm:ss host tag[pid]: msg`)
+    /// used to plan as `txt-prose`, so timestamp, host and severity were not
+    /// fields and the stemmer kept the stop word `is`. It plans as `logs`
+    /// with the english analyzer.
+    #[test]
+    fn phone_syslog_plans_as_logs_with_the_english_analyzer() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("phones.log"),
+            "<131>Oct 16 09:06:58 192.168.1.20 SIP [990]: registration failed\n\
+             <134>Oct 16 09:07:01 192.168.1.20 SIP [990]: call cleared\n\
+             <131>Oct 16 09:07:02 192.168.1.21 SIP[991]: SIP engine not registered\n\
+             <134>Oct 16 09:07:03 192.168.1.21 SIP[991]: watchdog reconnect\n\
+             Oct 16 09:07:04 pbx pbx-phone[990]: configuration loaded\n\
+             Oct 16 09:07:05 pbx pbx-phone[991]: device is online\n",
+        )
+        .unwrap();
+        let plan = plan_for(root);
+        let logs: Vec<_> = plan
+            .datasets
+            .iter()
+            .filter(|d| d.family == "logs")
+            .collect();
+        assert_eq!(
+            logs.len(),
+            1,
+            "expected one logs dataset, got {:?}",
+            plan.datasets
+                .iter()
+                .map(|d| (
+                    d.slug.as_str(),
+                    d.family.as_str(),
+                    d.text_analyzer.as_deref()
+                ))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            logs[0].text_analyzer.as_deref(),
+            Some(infer::LOG_TEXT_ANALYZER)
+        );
+        let names: Vec<&str> = logs[0].specs.iter().map(|s| s.name.as_str()).collect();
+        for field in ["ts", "host", "program", "message", "severity"] {
+            assert!(names.contains(&field), "missing {field} in {names:?}");
+        }
+        let spec = |name: &str| {
+            logs[0]
+                .specs
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("missing {name}"))
+        };
+        assert_eq!(spec("ts").es_type, "date", "a time window filters on ts");
+        assert_eq!(logs[0].time_field.as_deref(), Some("ts"));
+        assert_eq!(spec("host").es_type, "keyword", "a device filter is exact");
+        assert_eq!(spec("severity").es_type, "keyword");
+        let body = dataset_create_body(logs[0]);
+        assert_eq!(
+            body["settings"]["index.query.default_match_operator"],
+            json!("and"),
+            "an omitted match on a log index requires every token"
+        );
+    }
+
+    /// #1504: vsftpd `xferlog` was already one record per line, but its ctime
+    /// stamp (`Fri Oct 16 09:06:58 2026`) was not a date, so a time-range
+    /// filter on the transfer log matched nothing. A prose file does not
+    /// pick up the log match-operator default.
+    #[test]
+    fn xferlog_timestamp_maps_as_date_and_prose_does_not_default_match_to_and() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("xferlog"),
+            "Fri Oct 16 09:06:58 2026 1 10.0.0.7 4242 /uploads/fw.bin b _ o r admin ftp 0 * c\n\
+             Fri Oct 16 09:07:10 2026 2 10.0.0.8 10 /uploads/invalid.bin b _ o r admin ftp 0 * i\n\
+             Sat Oct 17 11:00:00 2026 0 10.0.0.9 0 /pub/README a C i a guest ftp 1 guest c\n\
+             Sun Oct 18 08:30:00 2026 4 10.0.0.7 100 /var/log/a.log b _ o r admin ftp 0 * c\n\
+             Mon Oct 19 09:06:58 2026 1 10.0.0.7 50 /uploads/cfg.xml b _ i r admin ftp 0 * c\n\
+             Tue Oct 20 09:06:58 2026 1 10.0.0.4 50 /uploads/cfg.xml b _ i r admin ftp 0 * c\n",
+        )
+        .unwrap();
+        let plan = plan_for(root);
+        let logs: Vec<_> = plan
+            .datasets
+            .iter()
+            .filter(|d| d.family == "logs")
+            .collect();
+        assert_eq!(
+            logs.len(),
+            1,
+            "{:?}",
+            plan.datasets.iter().map(|d| &d.family).collect::<Vec<_>>()
+        );
+        let ts = logs[0]
+            .specs
+            .iter()
+            .find(|s| s.name == "ts")
+            .expect("xferlog ts");
+        assert_eq!(ts.es_type, "date", "{ts:?}");
+        assert!(
+            ts.date_enc
+                .as_deref()
+                .is_some_and(|e| e.contains("asctime")),
+            "{ts:?}"
+        );
+        assert_eq!(logs[0].time_field.as_deref(), Some("ts"));
+        let host = logs[0].specs.iter().find(|s| s.name == "host").unwrap();
+        assert_eq!(host.es_type, "keyword");
+        assert_eq!(
+            dataset_create_body(logs[0])["settings"]["index.query.default_match_operator"],
+            json!("and")
+        );
+
+        let prose = tempfile::tempdir().unwrap();
+        std::fs::write(prose.path().join("README.md"), PROSE).unwrap();
+        let prose_plan = plan_for(prose.path());
+        assert!(!prose_plan.datasets.is_empty());
+        assert!(prose_plan.datasets.iter().all(|d| d.family != "logs"));
+        for dataset in &prose_plan.datasets {
+            assert!(
+                dataset_create_body(dataset)["settings"]
+                    .get("index.query.default_match_operator")
+                    .is_none(),
+                "a non-log index keeps match's OR default"
+            );
+        }
+    }
+
     const CODE: &str = "// The event loop dispatches every ready connection to a worker.\n\
         // Each worker drains its queue before polling for more sockets.\n\
         static void dispatch_ready_connections(struct event_loop *loop) {\n\
@@ -4463,9 +4607,18 @@ fn build_phase_a(
             .members
             .iter()
             .any(|&m| matches!(file_meta[m], Some((Family::Code, _))));
-        let text_analyzer =
-            infer::elect_dataset_analyzer(&specs, &c.fields, has_code, cfg.code_analyzer)
-                .map(str::to_string);
+        // A pure log cluster (not a docs cluster a log file was demoted
+        // into). `c.family` is the cluster's own family; docs clusters are
+        // labelled `Family::Code` by `dataset::cluster`.
+        let log_dataset = c.family == Family::Logs && !c.is_docs;
+        let text_analyzer = infer::elect_dataset_analyzer(
+            &specs,
+            &c.fields,
+            has_code,
+            cfg.code_analyzer,
+            log_dataset,
+        )
+        .map(str::to_string);
         datasets.push(PlanDataset {
             slug: c.slug.clone(),
             index: format!("{}-{}", cfg.prefix, c.slug),
@@ -13892,6 +14045,7 @@ mod bulk_pipe_tests {
             first_error: None,
             first_server_error: None,
             throttled_out: 0,
+            exhausted_after: None,
         }
     }
 

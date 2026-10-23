@@ -21,19 +21,51 @@ use crate::{EngineError, Result};
 
 // ── Memory-pressure drain plumbing (issue #948) ─────────────────────────────
 //
-// The parent RSS breaker used to only REJECT writes (429). Under a workload
+// The parent breaker used to only REJECT writes (429). Under a workload
 // whose caches hold gigabytes of re-hydratable state and whose memtable
 // holds raw write payloads, rejection frees nothing: the breaker stays
-// engaged, the client retries forever, and the run never finishes — exactly
+// engaged, the client retries, and the run never finishes — exactly
 // the #948 mailbox ingest (16 GiB cap, 26.5 GiB demand, 118-147 s engaged
-// stretches, 3-4 s releases). The sampler now also requests a DRAIN: flush
-// every index, release rebuildable caches, purge allocator pages.
+// stretches, 3-4 s releases) and the #2238 corpus-index loop (8 GiB auto
+// tier, dozens of indices under their own flush line but over the 2 GiB
+// summed-memtable budget, indexed count stuck at 0). The sampler requests
+// a DRAIN on either latch: flush every index, release rebuildable caches,
+// purge allocator pages.
 
 /// Minimum spacing between automatic drains while the breaker stays engaged.
 /// The engage edge always fires immediately; repeats are rate-limited so a
 /// long pinned stretch drains progressively (caches refill under continued
 /// reads) without the drain worker competing with ingest for every tick.
 const MEMORY_DRAIN_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Whether this sampler tick should ask the drain worker to run (#948, #2238).
+///
+/// `needs_drain` is [`crate::governor::ResourceGovernor::ingest_pressure_needs_drain`]:
+/// the RSS latch or the summed-memtable latch. A memtable-only trip used to
+/// return false here, so a multi-index ingest that had filled the auto tier's
+/// 2 GiB memtable budget kept receiving HTTP 429 with nothing flushed and the
+/// indexed count stayed at 0. The engage edge fires immediately; while the
+/// latch stays up, repeats wait `min_interval`. Releasing the latch clears
+/// the timer so the next engage drains at once.
+fn pressure_drain_due(
+    needs_drain: bool,
+    last_drain_at: &mut Option<std::time::Instant>,
+    now: std::time::Instant,
+    min_interval: std::time::Duration,
+) -> bool {
+    if !needs_drain {
+        *last_drain_at = None;
+        return false;
+    }
+    let due = match *last_drain_at {
+        None => true,
+        Some(at) => now.saturating_duration_since(at) >= min_interval,
+    };
+    if due {
+        *last_drain_at = Some(now);
+    }
+    due
+}
 
 /// Bounded request channel from the sampler thread to the drain worker.
 /// Capacity 1 + try_send ⇒ requests coalesce: one arrives mid-drain is
@@ -864,6 +896,11 @@ pub struct Engine {
     /// `redb/src/error.rs:65`; Apache-2.0/MIT, shape adapted, no code
     /// copied).
     cluster_state_boot: Arc<ClusterStateBootStatus>,
+    /// Raft proposer for cluster metadata. `None` unless
+    /// [`Engine::attach_cluster`] ran, which the server does only after the
+    /// cluster transport is up. Single-node boots leave this empty and every
+    /// index create/delete/mapping/settings path stays local.
+    cluster: Arc<parking_lot::Mutex<Option<xerj_cluster::ClusterHandle>>>,
 }
 
 impl Engine {
@@ -1016,6 +1053,7 @@ impl Engine {
             _node_lock: node_lock,
             cluster_state_write: Arc::new(parking_lot::Mutex::new(())),
             cluster_state_boot: Arc::new(cluster_state_status),
+            cluster: Arc::new(parking_lot::Mutex::new(None)),
         };
 
         // A rejected cluster-state document means this binary cannot know the
@@ -1396,7 +1434,11 @@ impl Engine {
     /// into `schema` (adding any the schema does not already define). Applied
     /// on every create path so template behavior is independent of whether the
     /// caller supplied settings.
-    fn apply_index_template(&self, name: &str, schema: Schema) -> Schema {
+    ///
+    /// The cluster proposer calls this once and replicates the effective
+    /// schema. The applier must not call it again: nodes can have different
+    /// local templates, and a second pass would diverge.
+    pub(crate) fn apply_index_template(&self, name: &str, schema: Schema) -> Schema {
         let mut effective_schema = schema;
         if let Some(tmpl) = self.best_matching_template(name) {
             if let Some(props) = tmpl.mappings.get("properties") {
@@ -1449,7 +1491,9 @@ impl Engine {
         // must reject here so HTTP, gRPC, direct CLI, and Console callers share
         // the same fail-closed boundary.
         self.ensure_cluster_state_writable()?;
-        let index_name = IndexName::new(name).map_err(EngineError::Common)?;
+        // Same rejection order as before the exact-create split: a bad name
+        // fails before the visibility and already-exists checks.
+        let _ = IndexName::new(name).map_err(EngineError::Common)?;
 
         // Per-index authorization backstop (issue #79): a caller that may not
         // see this name must not be able to bring it into existence either —
@@ -1482,9 +1526,39 @@ impl Engine {
 
         // Apply matching template (highest priority wins) on every create path.
         let effective_schema = self.apply_index_template(name, schema);
+        self.create_index_exact(name, effective_schema, settings)
+    }
+
+    /// Create `name` with `schema` exactly as given.
+    ///
+    /// Does not apply index templates and does not consult the per-request
+    /// visibility guard. The single-node create path applies the template and
+    /// checks visibility first. The cluster applier calls this so every member
+    /// materialises the schema the accepting node already resolved.
+    pub(crate) fn create_index_exact(
+        &self,
+        name: &str,
+        schema: Schema,
+        settings: serde_json::Value,
+    ) -> Result<()> {
+        self.ensure_cluster_state_writable()?;
+        let index_name = IndexName::new(name).map_err(EngineError::Common)?;
+
+        if self.indices.contains_key(name) {
+            return Err(EngineError::Common(
+                xerj_common::XerjError::index_already_exists(name),
+            ));
+        }
+
+        if let Some(f) = self.failed_indices.get(name) {
+            return Err(EngineError::Common(
+                xerj_common::XerjError::index_unavailable(name, f.reason.clone()),
+            ));
+        }
+
         let idx = Index::create_with_settings(
             index_name,
-            effective_schema,
+            schema,
             settings,
             &self.config,
             &self.data_dir,
@@ -2440,6 +2514,24 @@ impl Engine {
     /// sitting in the document on disk — the same lie in a different shape.
     /// A typed 503 is the only honest answer while the node cannot see the
     /// operator's configuration.
+    /// Install the Raft handle the server built for this process.
+    ///
+    /// Called once, after console bootstrap, so system indices created during
+    /// boot stay node-local. Later calls replace the handle.
+    pub fn attach_cluster(&self, handle: xerj_cluster::ClusterHandle) {
+        *self.cluster.lock() = Some(handle);
+    }
+
+    /// `true` when metadata writes must go through the Raft log.
+    pub fn has_cluster(&self) -> bool {
+        self.cluster.lock().is_some()
+    }
+
+    /// Clone of the proposer. The lock is not held across the subsequent await.
+    pub fn cluster_handle(&self) -> Option<xerj_cluster::ClusterHandle> {
+        self.cluster.lock().clone()
+    }
+
     pub fn ensure_cluster_state_writable(&self) -> Result<()> {
         if self.cluster_state_boot.is_writable() {
             return Ok(());
@@ -3094,6 +3186,33 @@ impl Engine {
                 xerj_common::XerjError::index_not_found(name),
             ));
         }
+        if let Some(handle) = self.cluster_handle() {
+            // A name this node does not have is a local 404. Proposing it
+            // would delete the index on peers and, on the ES surface, come
+            // back as acknowledged once the not-found is swallowed.
+            if !self.indices.contains_key(name) && !self.failed_indices.contains_key(name) {
+                return Err(EngineError::Common(
+                    xerj_common::XerjError::index_not_found(name),
+                ));
+            }
+            let effect = handle
+                .propose(xerj_cluster::ClusterCommand::DeleteIndex {
+                    name: name.to_string(),
+                })
+                .await
+                .map_err(crate::cluster_apply::propose_error)?;
+            return crate::cluster_apply::effect_result(name, effect);
+        }
+        self.delete_index_local(name).await
+    }
+
+    /// Remove `name` from this node's storage.
+    ///
+    /// Does not propose. The cluster applier calls this after the delete has
+    /// committed. The single-node [`Engine::delete_index`] falls through here
+    /// after the visibility check.
+    pub(crate) async fn delete_index_local(&self, name: &str) -> Result<()> {
+        self.ensure_cluster_state_writable()?;
         match self.indices.remove(name).map(|(_, v)| v) {
             Some(idx) => {
                 // The handle is pulled out of the map first so no write can
@@ -3451,28 +3570,90 @@ impl Engine {
 
     /// V4 M5.2 — route a document to the node that owns its shard.
     ///
-    /// Returns `Ok(None)` when the doc belongs to this node (handle it
-    /// locally via the existing `Index::index_document_with_version`
-    /// path). Returns `Ok(Some(node_id))` when the doc belongs to a
-    /// peer and must be forwarded via the cluster transport.
+    /// Returns `None` when this node should write the document itself:
+    /// there is no shard assignment (single-node mode, and any index that
+    /// was not created through the replicated shard plan), or the assigned
+    /// owner is this node. Returns `Some(node_id)` when a peer owns the
+    /// shard. Callers forward that write; they do not also store it here.
     ///
-    /// In single-node mode (`num_shards == 1` and the router has no
-    /// assignments) this always resolves to "local" and the caller
-    /// takes the existing fast path — zero overhead for single-node
-    /// deployments.
+    /// With no cluster handle the owner comparison uses `"local"`, which
+    /// no replicated plan names, and the empty routing table makes every
+    /// call `None`.
     pub fn route_write(&self, index: &str, doc_id: &str) -> Option<String> {
+        let me = self.routing_node_id();
         let router = self.shard_router.read();
-        let (_shard, owner) = router.route_doc(index, doc_id);
-        match owner {
-            // No assignment yet — treat as local. This is the
-            // single-node default path.
+        match router.route_doc(index, doc_id).1 {
             None => None,
-            Some(owner) if owner == self.node_id.as_str() => None,
+            Some(owner) if owner == me => None,
             Some(owner) => Some(owner.to_string()),
         }
     }
 
-    /// Read-only view of the local node id.
+    /// `true` when a replicated shard plan names this node as the primary
+    /// for `doc_id`. An index with no plan is `false` — that is not the
+    /// same as [`Engine::route_write`] returning `None`, which also covers
+    /// the unassigned case.
+    pub fn owns_shard(&self, index: &str, doc_id: &str) -> bool {
+        let me = self.routing_node_id();
+        let router = self.shard_router.read();
+        matches!(router.route_doc(index, doc_id).1, Some(owner) if owner == me)
+    }
+
+    /// Node ids that hold at least one primary of `index`, sorted.
+    pub fn shard_search_targets(&self, index: &str) -> Vec<String> {
+        self.shard_router.read().search_targets(index)
+    }
+
+    /// Identity [`Engine::route_write`] compares against shard owners.
+    ///
+    /// The cluster handle's node id when one is attached, otherwise the
+    /// single-node `"local"` id.
+    pub fn routing_node_id(&self) -> String {
+        self.cluster
+            .lock()
+            .as_ref()
+            .map(|handle| handle.node_id().to_string())
+            .unwrap_or_else(|| self.node_id.to_string())
+    }
+
+    /// Replace `index`'s primary assignments and widen the hash width so
+    /// every shard in `plan` is reachable.
+    pub fn install_shard_plan(&self, index: &str, plan: &[xerj_cluster::ShardAssignment]) {
+        if plan.is_empty() {
+            return;
+        }
+        let mut router = self.shard_router.write();
+        let width = plan
+            .iter()
+            .map(|assignment| assignment.shard.saturating_add(1))
+            .max()
+            .unwrap_or(1);
+        if width > router.num_shards() {
+            router.set_num_shards(width);
+        }
+        router.clear_index(index);
+        for assignment in plan {
+            router.assign(index, assignment.shard, &assignment.node_id);
+        }
+    }
+
+    /// Record one primary without dropping the index's other shards.
+    pub fn assign_one_shard(&self, index: &str, shard: u32, node_id: &str) {
+        let mut router = self.shard_router.write();
+        let width = shard.saturating_add(1);
+        if width > router.num_shards() {
+            router.set_num_shards(width);
+        }
+        router.assign(index, shard, node_id);
+    }
+
+    /// Drop `index` from the routing table. Called when a delete commits.
+    pub fn clear_shard_plan(&self, index: &str) {
+        self.shard_router.write().clear_index(index);
+    }
+
+    /// Read-only view of the single-node id (`"local"` unless a test
+    /// replaced the field). Cluster routing uses [`Engine::routing_node_id`].
     pub fn local_node_id(&self) -> &str {
         self.node_id.as_str()
     }
@@ -4073,26 +4254,23 @@ impl Engine {
                 let (disk_pct, disk_avail) = crate::governor::disk_used_pct_and_avail(&data_dir);
                 governor.refresh_memory_disk(rss, disk_pct, disk_avail);
 
-                // Issue #948 — a breaker that only rejects never lets a
-                // memory-pinned workload finish: caches hold gigabytes
-                // of re-hydratable state and the memtable holds raw
-                // write payloads, and 429s free none of it. Request a
-                // drain on the engage edge and at most once per window
-                // while engaged. try_send never blocks, so Thread A's
-                // no-lock/no-block contract above still holds.
-                if governor.memory_breaker_engaged() {
-                    let fire = match last_drain_at {
-                        None => true,
-                        Some(at) => at.elapsed() >= MEMORY_DRAIN_MIN_INTERVAL,
-                    };
-                    if fire {
-                        last_drain_at = Some(std::time::Instant::now());
-                        if let Some(tx) = MEMORY_DRAIN_TX.get() {
-                            let _ = tx.try_send(());
-                        }
+                // Issue #948 / #2238 — a breaker that only rejects never lets
+                // a memory-pinned workload finish: caches hold gigabytes of
+                // re-hydratable state and the memtable holds raw write
+                // payloads, and 429s free none of it. Request a drain on the
+                // engage edge of EITHER parent latch (RSS or summed memtable)
+                // and at most once per window while it stays engaged.
+                // try_send never blocks, so Thread A's no-lock/no-block
+                // contract above still holds.
+                if pressure_drain_due(
+                    governor.ingest_pressure_needs_drain(),
+                    &mut last_drain_at,
+                    std::time::Instant::now(),
+                    MEMORY_DRAIN_MIN_INTERVAL,
+                ) {
+                    if let Some(tx) = MEMORY_DRAIN_TX.get() {
+                        let _ = tx.try_send(());
                     }
-                } else {
-                    last_drain_at = None;
                 }
 
                 // Runtime disk flood-stage override, matching ES's
@@ -5409,5 +5587,43 @@ mod governor_thread_spawn_tests {
             || {},
         );
         assert!(!started);
+    }
+}
+
+#[cfg(test)]
+mod pressure_drain_tests {
+    use super::pressure_drain_due;
+    use std::time::{Duration, Instant};
+
+    /// #2238: the engage edge drains immediately, a still-engaged latch does
+    /// not drain again inside the window, and releasing the latch arms the
+    /// next engage. `needs_drain` is the governor's memtable-or-RSS predicate.
+    #[test]
+    fn pressure_drain_fires_on_the_engage_edge_and_respects_the_window() {
+        let mut last = None;
+        let t0 = Instant::now();
+        let window = Duration::from_secs(2);
+        assert!(pressure_drain_due(true, &mut last, t0, window));
+        assert!(
+            !pressure_drain_due(true, &mut last, t0 + Duration::from_millis(500), window),
+            "one engaged stretch drains once per window"
+        );
+        assert!(pressure_drain_due(
+            true,
+            &mut last,
+            t0 + Duration::from_secs(2),
+            window
+        ));
+        assert!(!pressure_drain_due(
+            false,
+            &mut last,
+            t0 + Duration::from_secs(3),
+            window
+        ));
+        assert!(last.is_none(), "a released latch clears the timer");
+        assert!(
+            pressure_drain_due(true, &mut last, t0 + Duration::from_secs(3), window),
+            "the next engage drains immediately"
+        );
     }
 }
