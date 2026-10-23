@@ -13694,7 +13694,7 @@ impl Index {
                                         .ensure_fts_encoded_field_component_format()
                                     {
                                         tracing::warn!(
-                                            "merge: encoded FTS filename format preflight failed: {e}"
+                                            "merge: encoded FTS filename format preflight failed: {e:#}"
                                         );
                                         return Ok(());
                                     }
@@ -13702,13 +13702,13 @@ impl Index {
                                         fts_writer.publish_encoded_filename_layout()
                                     {
                                         tracing::warn!(
-                                            "merge: FTS filename-layout publication failed: {e}"
+                                            "merge: FTS filename-layout publication failed: {e:#}"
                                         );
                                         return Ok(());
                                     }
                                 }
                                 if let Err(e) = fts_writer.finish() {
-                                    tracing::warn!("merge: FTS build failed: {e}");
+                                    tracing::warn!("merge: FTS build failed: {e:#}");
                                 }
                                 Ok(())
                             });
@@ -13782,7 +13782,7 @@ impl Index {
                                 &columns,
                                 merge_zstd_level,
                             ) {
-                                tracing::warn!("merge: doc-values write failed: {e}");
+                                tracing::warn!("merge: doc-values write failed: {e:#}");
                             }
                         }
                     }
@@ -34310,7 +34310,7 @@ async fn do_flush_shard(
                     write_doc_values_sidecar(&segments_dir_for_dv, meta.id.as_str(), &columns)
                         .map_err(|error| {
                             xerj_storage::StorageError::Io(std::io::Error::other(format!(
-                                "doc-values side-car write failed: {error}"
+                                "doc-values side-car write failed: {error:#}"
                             )))
                         })?;
                 }
@@ -34338,13 +34338,13 @@ async fn do_flush_shard(
                         .publish_encoded_filename_layout()
                         .map_err(|error| {
                             xerj_storage::StorageError::Io(std::io::Error::other(format!(
-                                "FTS filename-layout publication failed: {error}"
+                                "FTS filename-layout publication failed: {error:#}"
                             )))
                         })?;
                 }
                 fts_writer.finish().map_err(|error| {
                     xerj_storage::StorageError::Io(std::io::Error::other(format!(
-                        "FTS side-car build failed: {error}"
+                        "FTS side-car build failed: {error:#}"
                     )))
                 })?;
                 fts_finish_us = t_fin.elapsed().as_micros();
